@@ -253,7 +253,8 @@ class GraphifyEngine:
             import numpy as np
             v1 = np.array(query_embedding)
             v2 = np.array(node_embedding)
-            similarity = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            similarity = np.dot(v1, v2) / denom if denom > 1e-10 else 0.0
             
             if similarity >= min_similarity:
                 results.append({
