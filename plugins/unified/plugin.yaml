@@ -1,0 +1,66 @@
+name: unified
+description: نظام ذاكرة موحد يدمج FTS5 + Knowledge Graph + WikiLLM
+version: 1.0.0
+author: Hermes Team
+license: MIT
+
+dependencies:
+  - networkx
+  - scikit-learn
+  - python-louvain
+  - leidenalg
+  - igraph
+  - sentence-transformers
+  - langchain
+  - pypdf
+
+config_schema:
+  db_path:
+    type: string
+    default: ~/.hermes/memory_store.db
+    description: مسار قاعدة بيانات الحقائق
+  
+  graphs_dir:
+    type: string
+    default: ~/.hermes/graphs
+    description: مجلد حفظ الرسوم المعرفية
+  
+  embedding_model:
+    type: string
+    default: BAAI/bge-m3
+    description: نموذج التضمين
+  
+  wikillm_root:
+    type: string
+    default: ~/wiki/llm/projects
+    description: جذر WikiLLM للفهرسة
+  
+  auto_index:
+    type: boolean
+    default: true
+    description: فهرسة تلقائية عند التغيير
+  
+  similarity_threshold:
+    type: float
+    default: 0.7
+    description: عتبة التشابه للحواف
+  
+  device:
+    type: string
+    default: cuda
+    description: الجهاز (cuda أو cpu)
+  
+  chunk_size:
+    type: integer
+    default: 384
+    description: حجم القطعة (أقل للعربية)
+  
+  chunk_overlap:
+    type: integer
+    default: 64
+    description: تداخل القطع
+  
+  community_algorithm:
+    type: string
+    default: leiden
+    description: خوارزمية المجتمعات (leiden أو louvain)
