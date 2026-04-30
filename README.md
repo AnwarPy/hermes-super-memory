@@ -185,6 +185,20 @@ python3 -m pytest unified/tests/ -v
 | **الخصوصية** | ⚠️ بيانات للسحابة | ✅ كل شيء على جهازك |
 | **التكلفة** | ⚠️ API keys | ✅ صفر |
 
+## 🔄 ترقية من إصدار سابق
+
+بعد تحديث `graph_builder.py` (تطبيع النص قبل التضمين)، الرسم القديم يحتاج إعادة فهرسة:
+
+```bash
+# إعادة بناء الرسم بالكامل
+python3 ~/.hermes/scripts/graph_updater.py
+
+# أو إعادة فهرسة مشروع محدد من داخل Hermes:
+# graph_index(path="~/project", reindex=True)
+```
+
+**لماذا؟** العقد القديمة مخزّنة بدون تطبيع عربي في الـ embeddings، فـ cosine similarity يخفق عند البحث بالنص المطبّع.
+
 ## ❓ استكشاف الأخطاء
 
 ### Ollama لا يعمل
