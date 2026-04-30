@@ -61,6 +61,15 @@ def save_tracker(tracker):
 # ============================================================
 
 def get_unsummarized_sessions(limit=BATCH_SIZE):
+    """Fetch sessions that haven't been summarized yet.
+    
+    Excludes:
+    - Sessions already in tracker (summarized_sessions)
+    - Sessions with id starting 'cron_' — these are cron job responses
+      summarizing themselves, which causes meta-noise loops where the
+      summarizer's own output becomes input for the next run.
+    - Sessions with fewer than 2 messages (no meaningful content)
+    """
     tracker = load_tracker()
     summarized = tracker.get("summarized_sessions", [])
 
@@ -75,6 +84,7 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
             FROM sessions
             WHERE id NOT IN ({placeholders})
             AND message_count >= 2
+            AND id NOT LIKE 'cron_%'
             ORDER BY started_at DESC
             LIMIT ?
         """
@@ -84,6 +94,7 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
             SELECT id, source, started_at, ended_at, message_count, title
             FROM sessions
             WHERE message_count >= 2
+            AND id NOT LIKE 'cron_%'
             ORDER BY started_at DESC
             LIMIT ?
         """, (limit,))

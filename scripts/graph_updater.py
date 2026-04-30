@@ -31,6 +31,12 @@ TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.graph_tracker.json")
 
 EMBEDDING_DIM = 1024  # BGE-M3 dimension
 
+# عتبة التشابه الدلالي للكشف عن التكرار (cosine similarity)
+# 0.92 = الحقيقة الجديدة شبه مطابقة لحقيقة موجودة (إعادة صياغة)
+# 0.95+ صارمة جداً، 0.85- متساهلة جداً وتدمج حقائق متمايزة
+# تجاوز هذه العتبة → تحديث الموجود بدلاً من إضافة جديد
+SEMANTIC_DEDUP_THRESHOLD = 0.92
+
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
     "project", "technical", "personal", "service", "general"
@@ -204,10 +210,34 @@ def _node_id(text):
     return hashlib.md5(text.encode()).hexdigest()[:12]
 
 def add_facts_to_graph(graph, facts):
+    import numpy as np
+
     now = datetime.now(timezone.utc).isoformat()
     nodes_added = 0
     edges_added = 0
+    nodes_merged = 0
     new_node_ids = []
+
+    # ====================================================
+    # Pre-build matrix of existing fact embeddings for dedup
+    # ====================================================
+    existing_fact_nodes = []  # list of (node_id, normalized_embedding)
+    existing_fact_matrix = None
+    
+    for nid, ndata in graph.nodes(data=True):
+        if ndata.get("type") != "fact":
+            continue
+        emb = ndata.get("embedding")
+        if emb and len(emb) == EMBEDDING_DIM:
+            existing_fact_nodes.append(nid)
+    
+    if existing_fact_nodes:
+        raw_matrix = np.asarray(
+            [graph.nodes[nid]["embedding"] for nid in existing_fact_nodes],
+            dtype=np.float32,
+        )
+        norms = np.linalg.norm(raw_matrix, axis=1, keepdims=True)
+        existing_fact_matrix = raw_matrix / np.maximum(norms, 1e-10)
 
     # Pre-generate category embeddings
     categories = set(f.get("category", "general") for f in facts)
@@ -232,38 +262,89 @@ def add_facts_to_graph(graph, facts):
 
         node_id = f"fact_{_node_id(key)}"
 
-        if not graph.has_node(node_id):
+        if graph.has_node(node_id):
+            # نفس الـ key بالحرف — تخطّي تماماً (السلوك القديم)
+            target_node_id = node_id
+        else:
             embedding = get_embedding(key)
 
-            graph.add_node(
-                node_id,
-                content=key,
-                type="fact",
-                category=category,
-                session_id=session_id,
-                importance=importance,
-                created_at=now,
-                embedding=embedding,
-            )
-            nodes_added += 1
-            new_node_ids.append(node_id)
+            # ====================================================
+            # Semantic dedup: ابحث عن fact موجود متشابه دلالياً
+            # ====================================================
+            duplicate_of = None
+            if existing_fact_matrix is not None and len(existing_fact_matrix) > 0:
+                q = np.asarray(embedding, dtype=np.float32)
+                q = q / max(np.linalg.norm(q), 1e-10)
+                sims = existing_fact_matrix @ q
+                max_idx = int(np.argmax(sims))
+                max_sim = float(sims[max_idx])
+                if max_sim >= SEMANTIC_DEDUP_THRESHOLD:
+                    duplicate_of = existing_fact_nodes[max_idx]
 
-            # Edge to category
-            cat_id = f"category_{category}"
-            if not graph.has_node(cat_id):
-                graph.add_node(
-                    cat_id,
-                    content=f"Category: {category}",
-                    type="category",
-                    category=category,
-                    created_at=now,
-                    embedding=cat_embeddings.get(cat_id, [0.0] * EMBEDDING_DIM),
+            if duplicate_of is not None:
+                # دمج: عزّز الموجود بدلاً من إنشاء نود جديد
+                existing = graph.nodes[duplicate_of]
+                existing["importance"] = min(
+                    5,
+                    max(
+                        existing.get("importance", 1),
+                        importance,
+                    ) + 0  # لا نزيد تلقائياً، فقط نضمن الأعلى
                 )
-            if not graph.has_edge(node_id, cat_id):
-                graph.add_edge(node_id, cat_id, weight=0.9, type="belongs_to")
-                edges_added += 1
+                existing["seen_count"] = existing.get("seen_count", 1) + 1
+                existing["last_seen_at"] = now
+                # احفظ الصياغة البديلة (مفيد للسياق)
+                aliases = existing.get("aliases", [])
+                if key not in aliases and key != existing.get("content"):
+                    aliases.append(key)
+                    existing["aliases"] = aliases[:10]  # حد أقصى 10 صياغات
+                target_node_id = duplicate_of
+                nodes_merged += 1
+            else:
+                graph.add_node(
+                    node_id,
+                    content=key,
+                    type="fact",
+                    category=category,
+                    session_id=session_id,
+                    importance=importance,
+                    seen_count=1,
+                    created_at=now,
+                    last_seen_at=now,
+                    embedding=embedding,
+                )
+                nodes_added += 1
+                new_node_ids.append(node_id)
+                target_node_id = node_id
 
-        # Edge to session
+                # حدّث المصفوفة المُسرَّعة لكي يُكشَف التكرار داخل هذه الدفعة نفسها
+                q_normalized = np.asarray(embedding, dtype=np.float32)
+                q_normalized = q_normalized / max(np.linalg.norm(q_normalized), 1e-10)
+                if existing_fact_matrix is None:
+                    existing_fact_matrix = q_normalized.reshape(1, -1)
+                else:
+                    existing_fact_matrix = np.vstack([
+                        existing_fact_matrix,
+                        q_normalized.reshape(1, -1),
+                    ])
+                existing_fact_nodes.append(node_id)
+
+                # Edge to category (لـ nodes جديدة فقط)
+                cat_id = f"category_{category}"
+                if not graph.has_node(cat_id):
+                    graph.add_node(
+                        cat_id,
+                        content=f"Category: {category}",
+                        type="category",
+                        category=category,
+                        created_at=now,
+                        embedding=cat_embeddings.get(cat_id, [0.0] * EMBEDDING_DIM),
+                    )
+                if not graph.has_edge(node_id, cat_id):
+                    graph.add_edge(node_id, cat_id, weight=0.9, type="belongs_to")
+                    edges_added += 1
+
+        # Edge to session — يُضاف للنود الهدف (جديد أو مدموج)
         if session_id:
             session_node = f"session_{_node_id(session_id)}"
             if not graph.has_node(session_node):
@@ -275,14 +356,16 @@ def add_facts_to_graph(graph, facts):
                     created_at=now,
                     embedding=get_embedding(f"Session {session_id[:16]}"),
                 )
-            if not graph.has_edge(node_id, session_node):
-                graph.add_edge(node_id, session_node, weight=0.7, type="from_session")
+            if not graph.has_edge(target_node_id, session_node):
+                graph.add_edge(target_node_id, session_node, weight=0.7, type="from_session")
                 edges_added += 1
 
-    # Similarity: new vs existing (not all-vs-all)
+    # ====================================================
+    # روابط التشابه بين النودات الجديدة والموجودة (للاسترجاع لاحقاً)
+    # ملاحظة: عتبة 0.7 هنا للروابط فقط — أي pair فوق DEDUP_THRESHOLD
+    # تم دمجها أصلاً في اللوب أعلاه ولن تصل إلى هنا.
+    # ====================================================
     if new_node_ids:
-        import numpy as np
-
         new_embs = []
         for nid in new_node_ids:
             emb = graph.nodes[nid].get("embedding", [])
@@ -307,7 +390,9 @@ def add_facts_to_graph(graph, facts):
 
             for i in range(len(new_embs)):
                 for j in range(len(existing_facts)):
-                    if sim[i][j] > 0.7:
+                    # النطاق: 0.7 ≤ sim < SEMANTIC_DEDUP_THRESHOLD
+                    # (أعلى من ذلك تم دمجه، أقل لا يستحق رابطاً)
+                    if 0.7 < sim[i][j] < SEMANTIC_DEDUP_THRESHOLD:
                         ni, nj = new_embs[i][0], existing_facts[j][0]
                         if not graph.has_edge(ni, nj):
                             graph.add_edge(ni, nj, weight=float(sim[i][j]), type="similar")
@@ -320,13 +405,13 @@ def add_facts_to_graph(graph, facts):
             sim = arr @ arr.T
             for i in range(len(new_embs)):
                 for j in range(i + 1, len(new_embs)):
-                    if sim[i][j] > 0.7:
+                    if 0.7 < sim[i][j] < SEMANTIC_DEDUP_THRESHOLD:
                         ni, nj = new_embs[i][0], new_embs[j][0]
                         if not graph.has_edge(ni, nj):
                             graph.add_edge(ni, nj, weight=float(sim[i][j]), type="similar")
                             edges_added += 1
 
-    return nodes_added, edges_added
+    return nodes_added, edges_added, nodes_merged
 
 # ============================================================
 # Main
@@ -360,10 +445,11 @@ def main():
     print(f"  New facts found: {len(new_facts)}")
 
     start = time.time()
-    nodes_added, edges_added = add_facts_to_graph(graph, new_facts)
+    nodes_added, edges_added, nodes_merged = add_facts_to_graph(graph, new_facts)
     elapsed = time.time() - start
 
     print(f"  Nodes added: {nodes_added}")
+    print(f"  Nodes merged (semantic dedup): {nodes_merged}")
     print(f"  Edges added: {edges_added}")
     print(f"  Embedding time: {elapsed:.1f}s")
 
