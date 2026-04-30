@@ -115,6 +115,7 @@ cp "$SCRIPT_DIR/plugins/unified/graph_engine.py" "$PLUGIN_DIR/"
 cp "$SCRIPT_DIR/plugins/unified/document_loader.py" "$PLUGIN_DIR/"
 cp "$SCRIPT_DIR/plugins/unified/community_detector.py" "$PLUGIN_DIR/"
 cp "$SCRIPT_DIR/plugins/unified/arabic_normalizer.py" "$PLUGIN_DIR/"
+cp "$SCRIPT_DIR/plugins/unified/text_splitter.py" "$PLUGIN_DIR/"
 
 # Copy tests
 if [ -d "$SCRIPT_DIR/plugins/unified/tests" ]; then
