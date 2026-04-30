@@ -24,8 +24,8 @@ SUMMARIES_DIR = os.path.expanduser("~/.hermes/memory/summaries")
 FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
 TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.summarizer_tracker.json")
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:3b")
 
 BATCH_SIZE = 5
 MAX_MESSAGES_PER_SESSION = 100
@@ -144,8 +144,20 @@ def generate_summary(session_id, messages):
 
     conversation_text = "\n".join(conversation_lines)
 
+    # كشف لغة الجلسة تلقائياً (#8)
+    arabic_chars = sum(1 for c in conversation_text if '\u0600' <= c <= '\u06FF')
+    total_chars = len(conversation_text.strip())
+    is_arabic_session = (arabic_chars / max(total_chars, 1)) > 0.3
+
+    lang_instruction = (
+        "أجب بالعربية الفصحى فقط. لا تستخدم الإنجليزية إلا للأسماء التقنية."
+        if is_arabic_session else
+        "Respond in English only."
+    )
+
     prompt = (
-        "You are a session summarizer. Analyze this conversation and produce:\n"
+        f"You are a session summarizer. {lang_instruction}\n"
+        "Analyze this conversation and produce:\n"
         "1. A 3-5 bullet point summary in Arabic (or English if the session is in English)\n"
         "2. Extract important facts as key-value pairs with categories\n\n"
         "Respond ONLY with valid JSON in this exact format:\n"

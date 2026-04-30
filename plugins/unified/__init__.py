@@ -27,6 +27,7 @@ import logging
 import json
 import re
 import time
+import threading
 import sys
 import hashlib
 from pathlib import Path
@@ -382,6 +383,8 @@ class GraphCache:
 class UnifiedMemoryProvider(MemoryProvider):
     """مزود ذاكرة موحد محسّن"""
     
+    _graphify_lock = threading.Lock()  # thread-safe lazy loading
+    
     def __init__(self, config=None):
         self.config = config or {}
         self._initialized = False
@@ -442,16 +445,18 @@ class UnifiedMemoryProvider(MemoryProvider):
             logger.warning("Failed to initialize FTS5: %s", e)
             self._ft_db = None
         
-        # تحميل قاموس المترادفات للتوسيع الدلالي
+        # تحميل قاموس المترادفات للتوسيع الدلالي (معطيل افتراضياً — BGE-M3 يعالج المرادفات دلالياً)
         self._synonym_dict = {}
-        try:
-            _syn_path = Path(__file__).resolve().parent / "synonym_dict.json"
-            if _syn_path.exists():
-                with open(_syn_path, encoding='utf-8') as fh:
-                    self._synonym_dict = json.load(fh)
-                logger.info("Synonym dict loaded: %d entries", len(self._synonym_dict))
-        except Exception as e:
-            logger.warning("Failed to load synonym_dict.json: %s", e)
+        self._enable_synonym_expansion = self.config.get("enable_synonym_expansion", False)
+        if self._enable_synonym_expansion:
+            try:
+                _syn_path = Path(__file__).resolve().parent / "synonym_dict.json"
+                if _syn_path.exists():
+                    with open(_syn_path, encoding='utf-8') as fh:
+                        self._synonym_dict = json.load(fh)
+                    logger.info("Synonym dict loaded: %d entries", len(self._synonym_dict))
+            except Exception as e:
+                logger.warning("Failed to load synonym_dict.json: %s", e)
         
         self._initialized = True
         logger.info("UnifiedMemoryProvider v3.5 fully initialized")
@@ -470,47 +475,54 @@ class UnifiedMemoryProvider(MemoryProvider):
         pass  # Lazy loading يتم في _get_graphify() عند أول طلب فعلي
     
     def _get_graphify(self):
-        """تهيئة Graphify عند أول طلب فقط (Lazy Loading)"""
+        """تهيئة Graphify عند أول طلب فقط (Lazy Loading — thread-safe)"""
         if self.graphify is None:
-            logger.info("Lazy-loading Graphify Engine...")
-            try:
-                # Hermes يحمّل الـ plugin كـ _hermes_user_memory.unified.*
-                # نحاول نجيبه من sys.modules أولاً لتجنب تحميل نسخة ثانية
-                graph_engine = None
-                for _mod_name in list(sys.modules.keys()):
-                    if _mod_name.endswith('.unified.graph_engine') and 'GraphifyEngine' in dir(sys.modules[_mod_name]):
-                        graph_engine = sys.modules[_mod_name]
-                        break
+            with self._graphify_lock:
+                if self.graphify is None:  # double-checked locking
+                    self._init_graphify()
+        return self.graphify
+    
+    def _init_graphify(self):
+        """تهيئة Graphify Engine (يُستدعى مرة واحدة فقط)"""
+        logger.info("Lazy-loading Graphify Engine...")
+        try:
+            # Hermes يحمّل الـ plugin كـ _hermes_user_memory.unified.*
+            # نحاول نجيبه من sys.modules أولاً لتجنب تحميل نسخة ثانية
+            graph_engine = None
+            for _mod_name in list(sys.modules.keys()):
+                if _mod_name.endswith('.unified.graph_engine') and 'GraphifyEngine' in dir(sys.modules[_mod_name]):
+                    graph_engine = sys.modules[_mod_name]
+                    break
 
-                if graph_engine is None:
-                    # Fallback: استيراد مباشر (للاختبار خارج Hermes)
-                    import importlib
-                    _plugins_dir = str(Path(__file__).resolve().parent.parent)
-                    if _plugins_dir not in sys.path:
-                        sys.path.insert(0, _plugins_dir)
-                    # تسجيل 'unified' كـ alias إذا الـ plugin محمّل تحت اسم مختلف
-                    if "unified" not in sys.modules:
-                        for _mod_name in list(sys.modules.keys()):
-                            if _mod_name.endswith('.unified'):
-                                _mod = sys.modules[_mod_name]
-                                sys.modules["unified"] = _mod
-                                _mod.__path__ = [str(Path(__file__).resolve().parent)]
-                                for _sub in ["graph_engine", "embedding_model", "document_loader",
-                                             "text_splitter", "graph_builder", "community_detector", "graph_storage"]:
-                                    _old = f"{_mod_name}.{_sub}"
-                                    _new = f"unified.{_sub}"
-                                    if _old in sys.modules and _new not in sys.modules:
-                                        sys.modules[_new] = sys.modules[_old]
-                                break
-                    graph_engine = importlib.import_module('unified.graph_engine')
+            if graph_engine is None:
+                # Fallback: استيراد مباشر (للاختبار خارج Hermes)
+                import importlib
+                _plugins_dir = str(Path(__file__).resolve().parent.parent)
+                if _plugins_dir not in sys.path:
+                    sys.path.insert(0, _plugins_dir)
+                # تسجيل 'unified' كـ alias إذا الـ plugin محمّل تحت اسم مختلف
+                if "unified" not in sys.modules:
+                    for _mod_name in list(sys.modules.keys()):
+                        if _mod_name.endswith('.unified'):
+                            _mod = sys.modules[_mod_name]
+                            sys.modules["unified"] = _mod
+                            _mod.__path__ = [str(Path(__file__).resolve().parent)]
+                            for _sub in ["graph_engine", "embedding_model", "document_loader",
+                                         "text_splitter", "graph_builder", "community_detector", "graph_storage"]:
+                                _old = f"{_mod_name}.{_sub}"
+                                _new = f"unified.{_sub}"
+                                if _old in sys.modules and _new not in sys.modules:
+                                    sys.modules[_new] = sys.modules[_old]
+                            break
+                graph_engine = importlib.import_module('unified.graph_engine')
 
-                GraphifyEngine = graph_engine.GraphifyEngine
-                logger.info("Creating GraphifyEngine with config: %s", self._graphify_config)
-                self.graphify = GraphifyEngine(self._graphify_config)
-                logger.info("Graphify Engine initialized (lazy)")
-            except Exception as e:
-                logger.error("Failed to initialize Graphify: %s", e, exc_info=True)
-                self.graphify = None
+            GraphifyEngine = graph_engine.GraphifyEngine
+            logger.info("Creating GraphifyEngine with config: %s", self._graphify_config)
+            self.graphify = GraphifyEngine(self._graphify_config)
+            logger.info("Graphify Engine initialized (lazy)")
+        except Exception as e:
+            logger.error("Failed to initialize Graphify: %s", e, exc_info=True)
+            self.graphify = None
         return self.graphify
     
     def system_prompt_block(self):
@@ -602,26 +614,45 @@ class UnifiedMemoryProvider(MemoryProvider):
                         continue
                 
                 project_results = []
+                # Vectorized similarity — بدلاً من O(N) loop
+                node_ids_list = []
+                embeddings_list = []
                 for node_id in graph.nodes():
                     node_embedding = graph.nodes[node_id].get("embedding")
-                    if node_embedding is None:
-                        continue
-                    
-                    v1 = np.array(query_embedding)
-                    v2 = np.array(node_embedding)
-                    similarity = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
-                    
-                    if similarity >= 0.5:  # GRAPH_SEARCH_MIN_SIMILARITY
-                        content = graph.nodes[node_id].get("content", "")
-                        cleaned = _clean_chunk(content)
-                        if cleaned:
-                            node_type = graph.nodes[node_id].get("type", "unknown")
-                            project_results.append({
-                                'similarity': similarity,
-                                'content': cleaned,
-                                'type': node_type,
-                                'project': project,
-                            })
+                    if node_embedding is not None and len(node_embedding) > 0:
+                        node_ids_list.append(node_id)
+                        embeddings_list.append(node_embedding)
+                
+                if not node_ids_list:
+                    continue
+                
+                emb_matrix = np.asarray(embeddings_list, dtype=np.float32)
+                q_vec = np.asarray(query_embedding, dtype=np.float32)
+                
+                # تطبيع
+                emb_norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+                emb_matrix = emb_matrix / np.maximum(emb_norms, 1e-10)
+                q_norm = np.linalg.norm(q_vec)
+                q_vec = q_vec / max(q_norm, 1e-10)
+                
+                # عملية واحدة بدلاً من N
+                sims = emb_matrix @ q_vec  # shape: (N,)
+                
+                # اختر الفائزين فقط
+                above = np.where(sims >= 0.5)[0]
+                top_indices = above[np.argsort(-sims[above])][:top_k_per_project]
+                
+                for idx in top_indices:
+                    nid = node_ids_list[idx]
+                    content = graph.nodes[nid].get("content", "")
+                    cleaned = _clean_chunk(content)
+                    if cleaned:
+                        project_results.append({
+                            'similarity': float(sims[idx]),
+                            'content': cleaned,
+                            'type': graph.nodes[nid].get("type", "unknown"),
+                            'project': project,
+                        })
                 
                 project_results.sort(key=lambda x: x['similarity'], reverse=True)
                 results.extend(project_results[:top_k_per_project])

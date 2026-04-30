@@ -23,8 +23,8 @@ SUMMARIES_DIR = os.path.expanduser("~/.hermes/memory/summaries")
 FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
 EXTRACTOR_TRACKER = os.path.expanduser("~/.hermes/memory/.extractor_tracker.json")
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:3b")
 
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
