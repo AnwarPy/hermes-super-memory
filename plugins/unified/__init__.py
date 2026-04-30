@@ -1018,7 +1018,11 @@ class UnifiedMemoryProvider(MemoryProvider):
                 
                 v1 = np.array(query_embedding)
                 v2 = np.array(node_embedding)
-                similarity = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+                v1_norm = np.linalg.norm(v1)
+                v2_norm = np.linalg.norm(v2)
+                if v1_norm < 1e-10 or v2_norm < 1e-10:
+                    continue
+                similarity = float(np.dot(v1, v2) / (v1_norm * v2_norm))
                 
                 if similarity >= 0.5:  # GRAPH_SEARCH_MIN_SIMILARITY
                     content = _clean_chunk(graph.nodes[node_id].get("content", ""))
