@@ -54,9 +54,9 @@ def normalize_alef(text: str) -> str:
     Examples:
         >>> normalize_alef('إسلام')
         'اسلام'
-        >>> normalize_alef('آمَنُوا')
+        >>> normalize_alef('آمنوا')
         'امنوا'
-        >>> normalize_alef('أَحَد')
+        >>> normalize_alef('أحد')
         'احد'
     """
     return _ALEF_PATTERN.sub('ا', text)
@@ -67,11 +67,13 @@ def normalize_hamza_extended(text: str) -> str:
 
     Examples:
         >>> normalize_hamza_extended('مؤسسة')
-        'مواسسه'
+        'موسسة'
         >>> normalize_hamza_extended('سؤال')
-        'سؤول'
+        'سوال'
         >>> normalize_hamza_extended('مسؤول')
         'مسوول'
+        >>> normalize_hamza_extended('قارئ')
+        'قاري'
     """
     text = _HAMZA_WAW_PATTERN.sub('و', text)
     text = _HAMZA_YAA_PATTERN.sub('ي', text)
@@ -86,9 +88,11 @@ def normalize_yaa(text: str) -> str:
 
     Examples:
         >>> normalize_yaa('هداية')
-        'هدايه'
+        'هداية'
         >>> normalize_yaa('موسى')
         'موسي'
+        >>> normalize_yaa('مستشفى')
+        'مستشفي'
     """
     return _ALEF_MAKSURA_PATTERN.sub('ي', text)
 
@@ -98,7 +102,7 @@ def normalize_ta_marbuta(text: str) -> str:
 
     Examples:
         >>> normalize_ta_marbuta('اللغة العربية')
-        'اللغه العربية'
+        'اللغه العربيه'
     """
     return _TA_MARBUTA_PATTERN.sub('ه', text)
 
@@ -142,7 +146,7 @@ def normalize_query(text: str) -> str:
         >>> normalize_query('آمَنُوا')
         'امنوا'
         >>> normalize_query('مؤسسة')
-        'مواسسه'
+        'موسسة'
         >>> normalize_query('مستشفى الى')
         'مستشفي الي'
     """

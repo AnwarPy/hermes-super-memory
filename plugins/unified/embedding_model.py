@@ -21,7 +21,7 @@ class EmbeddingModel:
     def __init__(
         self,
         model_name: str = "BAAI/bge-m3",
-        device: str = "cuda",
+        device: str = "auto",
         use_fp16: bool = True,
         cache_dir: Optional[str] = None,
     ):
@@ -67,13 +67,24 @@ class EmbeddingModel:
             print(f"  - FP16: {use_fp16}")
     
     def _select_device(self, preferred_device: str) -> str:
-        """اختيار الجهاز المتاح"""
+        """اختيار الجهاز المتاح
+        
+        - auto: اختيار تلقائي حسب الأفضلية cuda > mps > cpu
+        - cuda/mps/cpu: استخدام المحدد، مع fallback آمن إلى cpu
+        """
+        if preferred_device == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+
         if preferred_device == "cuda" and torch.cuda.is_available():
             return "cuda"
-        elif preferred_device == "mps" and torch.backends.mps.is_available():
+        elif preferred_device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
         else:
-            if preferred_device != "cpu":
+            if preferred_device not in ("cpu", "auto"):
                 print(f"تحذير: {preferred_device} غير متاح، جاري استخدام CPU")
             return "cpu"
     

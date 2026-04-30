@@ -158,7 +158,7 @@ def generate_summary(session_id, messages):
     prompt = (
         f"You are a session summarizer. {lang_instruction}\n"
         "Analyze this conversation and produce:\n"
-        "1. A 3-5 bullet point summary in Arabic (or English if the session is in English)\n"
+        "1. A 3-5 bullet point summary (in the language specified above).\n"
         "2. Extract important facts as key-value pairs with categories\n\n"
         "Respond ONLY with valid JSON in this exact format:\n"
         '{"summary": ["point 1", "point 2"], '

@@ -100,6 +100,35 @@ class TextSplitter:
 
         return overlapped
 
+    def split(self, docs, file_type=None) -> list:
+        """واجهة متوافقة مع graph_engine.py — يستقبل قائمة Documents.
+
+        الـ ``file_type`` غير مستخدم حالياً ومُحفوظ للتوافق مع
+        ``graph_engine.index_directory()`` الذي يمرّره (السطر 130).
+        """
+        results = []
+        for doc in docs:
+            if hasattr(doc, "page_content"):
+                text = doc.page_content
+                metadata = getattr(doc, "metadata", {})
+            elif isinstance(doc, dict):
+                text = doc.get("page_content", doc.get("content", ""))
+                metadata = doc.get("metadata", {})
+            else:
+                text = str(doc)
+                metadata = {}
+
+            chunks = self.split_text(text)
+            for chunk in chunks:
+                if hasattr(doc, "page_content"):
+                    from copy import copy
+                    new_doc = copy(doc)
+                    new_doc.page_content = chunk
+                    results.append(new_doc)
+                else:
+                    results.append({"page_content": chunk, "metadata": metadata})
+        return results
+
 
 def split_documents(docs: list, chunk_size: int = 512, chunk_overlap: int = 96) -> list:
     """تقسيم قائمة من المستندات (langchain Document objects أو dicts)."""

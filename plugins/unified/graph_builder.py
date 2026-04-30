@@ -55,7 +55,22 @@ class KnowledgeGraphBuilder:
         
         # استخراج التضمين إذا لم يُقدم
         if embedding is None and self.embeddings:
-            embedding = self.embeddings.embed_query(content)
+            # تطبيع النص العربي قبل التضمين — للاتساق مع وقت البحث
+            # (انظر arabic_normalizer.normalize_query في __init__.py:569)
+            normalize_query = None
+            is_arabic = None
+            try:
+                from .arabic_normalizer import normalize_query, is_arabic
+            except (ImportError, ValueError):
+                try:
+                    from arabic_normalizer import normalize_query, is_arabic  # type: ignore
+                except ImportError:
+                    pass
+            if normalize_query is not None and is_arabic(content):
+                embed_text = normalize_query(content)
+            else:
+                embed_text = content
+            embedding = self.embeddings.embed_query(embed_text)
         elif embedding is None:
             raise ValueError("embedding مطلوب إذا لم يكن embedding_model مُهيأ")
         
@@ -94,14 +109,31 @@ class KnowledgeGraphBuilder:
         """
         node_ids = []
         
-        # استخراج النصوص
-        texts = [doc.get("page_content", "") for doc in documents]
+        # استخراج النصوص — مع تطبيع للنصوص العربية للاتساق وقت البحث
+        normalize_query = None
+        is_arabic = None
+        try:
+            from .arabic_normalizer import normalize_query, is_arabic
+        except (ImportError, ValueError):
+            try:
+                from arabic_normalizer import normalize_query, is_arabic  # type: ignore
+            except ImportError:
+                pass
         
-        # استخراج دفعات من التضمينات
+        raw_texts = [doc.get("page_content", "") for doc in documents]
+        if normalize_query is not None:
+            texts = [
+                normalize_query(t) if (t and is_arabic(t)) else t
+                for t in raw_texts
+            ]
+        else:
+            texts = raw_texts
+        
+        # استخراج دفعات من التضمينات (على النص المطبَّع)
         print(f"جاري استخراج تضمينات {len(texts)} وثيقة...")
         all_embeddings = self.embeddings.embed_documents(texts, batch_size=batch_size)
         
-        # إضافة العقد
+        # إضافة العقد — نخزّن المحتوى الأصلي للعرض، والتضمين على المطبَّع
         for i, (doc, emb) in enumerate(zip(documents, all_embeddings)):
             node_id = self.add_node(
                 content=doc.get("page_content", ""),

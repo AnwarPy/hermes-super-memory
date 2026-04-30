@@ -47,8 +47,13 @@ config_schema:
   
   device:
     type: string
-    default: cuda
-    description: الجهاز (cuda أو cpu)
+    default: auto
+    description: الجهاز (auto / cuda / mps / cpu)
+  
+  enable_synonym_expansion:
+    type: boolean
+    default: false
+    description: تفعيل توسيع الاستعلام بقاموس المترادفات (افتراضياً معطّل — BGE-M3 يعالج المرادفات دلالياً)
   
   chunk_size:
     type: integer

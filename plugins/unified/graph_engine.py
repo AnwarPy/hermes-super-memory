@@ -41,7 +41,7 @@ class GraphifyEngine:
         # إعدادات
         self.graphs_dir = self.config.get("graphs_dir", "~/.hermes/graphs")
         self.embedding_model_name = self.config.get("embedding_model", "BAAI/bge-m3")
-        self.device = self.config.get("device", "cuda")
+        self.device = self.config.get("device", "auto")
         self.similarity_threshold = self.config.get("similarity_threshold", 0.7)
         self.chunk_size = self.config.get("chunk_size", 512)  # 512 أفضل للعربية
         self.chunk_overlap = self.config.get("chunk_overlap", 96)

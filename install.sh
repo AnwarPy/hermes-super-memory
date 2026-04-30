@@ -127,9 +127,11 @@ if [ -f "$SCRIPT_DIR/plugins/unified/plugin.yaml" ]; then
     cp "$SCRIPT_DIR/plugins/unified/plugin.yaml" "$PLUGIN_DIR/"
 fi
 
-# Copy synonym dict if exists
+# Copy synonym dict ONLY if user provided a custom one
+# (الـ repo لا يشحن قاموس افتراضياً — BGE-M3 يعالج المرادفات دلالياً)
 if [ -f "$SCRIPT_DIR/plugins/unified/synonym_dict.json" ]; then
     cp "$SCRIPT_DIR/plugins/unified/synonym_dict.json" "$PLUGIN_DIR/"
+    echo -e "${YELLOW}  ℹ️  synonym_dict.json found and copied (set enable_synonym_expansion: true to use)${NC}"
 fi
 
 echo -e "${GREEN}  ✅ Plugin installed${NC}"
@@ -142,12 +144,18 @@ echo -e "${YELLOW}[6/6] Setting up cron jobs...${NC}"
 # Create cron wrapper scripts
 cat > "$HERMES_HOME/scripts/run_summarizer.sh" << 'EOF'
 #!/bin/bash
+# Cron has minimal env — استورد إعدادات المستخدم
+[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null
+[ -f "$HOME/.hermes/.env" ] && set -a && . "$HOME/.hermes/.env" && set +a
 cd ~/.hermes
 python3 scripts/session_summarizer.py >> ~/.hermes/logs/summarizer.log 2>&1
 EOF
 
 cat > "$HERMES_HOME/scripts/run_graph_updater.sh" << 'EOF'
 #!/bin/bash
+# Cron has minimal env — استورد إعدادات المستخدم
+[ -f "$HOME/.profile" ] && . "$HOME/.profile" 2>/dev/null
+[ -f "$HOME/.hermes/.env" ] && set -a && . "$HOME/.hermes/.env" && set +a
 cd ~/.hermes
 python3 scripts/fact_extractor.py >> ~/.hermes/logs/graph_updater.log 2>&1
 python3 scripts/graph_updater.py >> ~/.hermes/logs/graph_updater.log 2>&1
