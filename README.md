@@ -69,7 +69,6 @@ hermes gateway restart
         ├── community_detector.py # اكتشاف المجتمعات (Leiden + Louvain)
         ├── arabic_normalizer.py # تطبيع عربي شامل
         ├── text_splitter.py    # تقسيم النصوص مع وعي بالعربية
-        ├── synonym_dict.json   # قاموس المترادفات (معطيل افتراضياً)
         ├── plugin.yaml         # إعدادات
         └── tests/              # 179 اختبار
             ├── test_arabic_normalizer.py  # 43 اختبار عربي
@@ -108,7 +107,7 @@ export HERMES_SUMMARIZER_MODEL=qwen2.5:7b
 # تغيير عنوان Ollama
 export OLLAMA_URL=http://localhost:11434/api/chat
 
-# تفعيل توسيع المترادفات (معطيل افتراضياً)
+# تفعيل توسيع المترادفات (معطّل افتراضياً) — يتطلب وضع synonym_dict.json يدوياً
 # في plugin.yaml:
 # enable_synonym_expansion: true
 ```
@@ -130,9 +129,9 @@ python3 -m pytest unified/tests/ -v
 
 ### تغطية الاختبارات:
 - **test_arabic_normalizer.py** — 43 اختبار (تطبيع عربي شامل)
-- **test_graph_builder.py** — 28 اختبار (بناء الرسوم)
+- test_graph_builder.py — 29 اختبار (بناء الرسوم)
 - **test_document_loader.py** — 34 اختبار (تحميل المستندات)
-- **test_unified_memory.py** — 43 اختبار (البحث الموحد)
+- test_unified_memory.py — 33 اختبار (البحث الموحد)
 - **test_graph_storage.py** — 25 اختبار (التخزين)
 - **test_community_detector.py** — 15 اختبار (اكتشاف المجتمعات)
 
