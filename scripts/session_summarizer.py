@@ -14,7 +14,7 @@ import re
 import time
 import hashlib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ============================================================
 # Configuration — 100% local
@@ -29,6 +29,14 @@ OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:3b")
 
 BATCH_SIZE = 5
 MAX_MESSAGES_PER_SESSION = 100
+
+# الجلسة لا تُلخَّص قبل أن تكون "خاملة" (idle) لمدة >= هذه الدقائق منذ آخر رسالة.
+# الهدف: تجنّب تلخيص جلسات لا تزال مفتوحة وقد تُضاف لها رسائل جديدة.
+# 30 دقيقة كافية لأن:
+#   - الـ cron يعمل كل ساعة، فلو المستخدم بدأ منذ 5 دقائق، تُلتقَط في الساعة التالية بعد أن تهدأ.
+#   - لو المستخدم في جلسة طويلة نشطة، لن تُلخَّص جزئياً قبل اكتمالها.
+# يمكن تجاوز هذا عبر env var: HERMES_SESSION_IDLE_MINUTES=N
+SESSION_IDLE_MINUTES = int(os.getenv("HERMES_SESSION_IDLE_MINUTES", "30"))
 
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
@@ -61,7 +69,7 @@ def save_tracker(tracker):
 # ============================================================
 
 def get_unsummarized_sessions(limit=BATCH_SIZE):
-    """Fetch sessions that haven't been summarized yet.
+    """Fetch sessions that haven't been summarized yet AND appear quiescent.
     
     Excludes:
     - Sessions already in tracker (summarized_sessions)
@@ -69,6 +77,10 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
       summarizing themselves, which causes meta-noise loops where the
       summarizer's own output becomes input for the next run.
     - Sessions with fewer than 2 messages (no meaningful content)
+    - Sessions with recent activity (last message within SESSION_IDLE_MINUTES)
+      → جلسة مفتوحة قد تستقبل رسائل جديدة. تلخيصها الآن يعني:
+        (أ) ضياع الرسائل اللاحقة (لن تُعاد معالجة الجلسة)
+        (ب) تلخيص ناقص يُنتج حقائق سطحية
     """
     tracker = load_tracker()
     summarized = tracker.get("summarized_sessions", [])
@@ -77,27 +89,41 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
+    # نحسب عتبة "آخر رسالة قبل X دقيقة" — لو آخر رسالة بعد هذا الوقت، الجلسة "نشطة"
+    idle_threshold = (
+        datetime.now(timezone.utc) - timedelta(minutes=SESSION_IDLE_MINUTES)
+    ).isoformat()
+
+    base_filters = """
+        s.message_count >= 2
+        AND s.id NOT LIKE 'cron_%'
+        AND NOT EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.session_id = s.id
+            AND m.timestamp > ?
+        )
+    """
+
     if summarized:
         placeholders = ",".join(["?" for _ in summarized])
         query = f"""
-            SELECT id, source, started_at, ended_at, message_count, title
-            FROM sessions
-            WHERE id NOT IN ({placeholders})
-            AND message_count >= 2
-            AND id NOT LIKE 'cron_%'
-            ORDER BY started_at DESC
+            SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count, s.title
+            FROM sessions s
+            WHERE s.id NOT IN ({placeholders})
+            AND {base_filters}
+            ORDER BY s.started_at DESC
             LIMIT ?
         """
-        cursor.execute(query, summarized + [limit])
+        cursor.execute(query, summarized + [idle_threshold, limit])
     else:
-        cursor.execute("""
-            SELECT id, source, started_at, ended_at, message_count, title
-            FROM sessions
-            WHERE message_count >= 2
-            AND id NOT LIKE 'cron_%'
-            ORDER BY started_at DESC
+        query = f"""
+            SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count, s.title
+            FROM sessions s
+            WHERE {base_filters}
+            ORDER BY s.started_at DESC
             LIMIT ?
-        """, (limit,))
+        """
+        cursor.execute(query, (idle_threshold, limit))
 
     sessions = [dict(row) for row in cursor.fetchall()]
     conn.close()
