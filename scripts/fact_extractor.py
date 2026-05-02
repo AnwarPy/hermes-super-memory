@@ -13,8 +13,62 @@ import os
 import re
 import sys
 import time
+import fcntl
+import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
+
+# ============================================================
+# Robust JSON parser (shared with session_summarizer)
+# ============================================================
+
+def robust_json_parse(content):
+    """Parse LLM JSON with 3 attempts: direct → extract block → fix errors."""
+    content = content.strip()
+    if not content:
+        return None
+
+    # Attempt 1: Direct parse
+    cleaned = content
+    if cleaned.startswith("```"):
+        idx = cleaned.find("\n")
+        if idx != -1:
+            cleaned = cleaned[idx + 1:]
+        last = cleaned.rfind("```")
+        if last != -1:
+            cleaned = cleaned[:last]
+        cleaned = cleaned.strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: Brace matching
+    brace_count = 0
+    start = -1
+    for i, ch in enumerate(content):
+        if ch == '{':
+            if brace_count == 0:
+                start = i
+            brace_count += 1
+        elif ch == '}':
+            brace_count -= 1
+            if brace_count == 0 and start >= 0:
+                candidate = content[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+
+    # Attempt 3: Fix common errors
+    fixed = cleaned
+    fixed = re.sub(r",\s*([}\]])", r'\1', fixed)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError as e:
+        print(f"  JSON parse failed: {e}")
+        return None
 
 # ============================================================
 # Configuration
@@ -24,7 +78,7 @@ FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
 EXTRACTOR_TRACKER = os.path.expanduser("~/.hermes/memory/.extractor_tracker.json")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:7b")
 
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
@@ -91,10 +145,17 @@ Session summary:
 Existing facts:
 {existing_text}
 
+RULES:
+- Each fact key must be a COMPLETE SENTENCE with SPECIFIC values (paths, URLs, versions, configs).
+- BAD: 'project_directory' → GOOD: 'Project source code is at /home/anwar/multica-source'
+- BAD: 'graph contains 13 nodes' → SKIP (snapshot stats, not a lasting fact)
+- Exclude: transient stats (node counts, file sizes, timestamps), generic phrases.
+- Include: file paths, URLs, API endpoints, versions, config values, decisions made, errors fixed.
+
 Extract NEW facts NOT in the existing list. Respond ONLY with valid JSON:
 {{
   "facts": [
-    {{"key": "fact description", "category": "technical"}}
+    {{"key": "complete sentence with specific value", "category": "technical"}}
   ]
 }}
 
@@ -110,30 +171,47 @@ Categories: preference, fact, decision, correction, project, technical, personal
         "options": {"temperature": 0.1, "num_predict": 500}
     }
 
-    try:
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            req = urllib.request.Request(
+                OLLAMA_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode("utf-8"))
 
-        content = result.get("message", {}).get("content", "")
-        parsed = parse_json_response(content)
-        facts = parsed.get("facts", [])
+            content = result.get("message", {}).get("content", "")
+            parsed = robust_json_parse(content)
+            if parsed is None:
+                return []
+            facts = parsed.get("facts", [])
 
-        # Validate categories
-        for f in facts:
-            if f.get("category") not in VALID_CATEGORIES:
-                f["category"] = "general"
+            # Validate categories
+            for f in facts:
+                if f.get("category") not in VALID_CATEGORIES:
+                    f["category"] = "general"
 
-        return facts
+            return facts
 
-    except Exception as e:
-        print(f"  Fact extraction failed: {e}")
-        return []
+        except urllib.error.URLError as e:
+            if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
+                print(f"  Fact extractor timeout (attempt {attempt+1})")
+                if attempt < max_retries:
+                    continue
+                return []
+            print(f"  Fact extractor network error: {e}")
+            return []
+        except TimeoutError:
+            print(f"  Fact extractor timeout (attempt {attempt+1})")
+            if attempt < max_retries:
+                continue
+            return []
+        except Exception as e:
+            print(f"  Fact extraction failed: {e}")
+            return []
 
 # ============================================================
 # Save facts
@@ -143,8 +221,34 @@ def save_facts(facts, session_id):
     """Save facts to category-specific JSONL files with consistent schema."""
     os.makedirs(FACTS_DIR, exist_ok=True)
 
+    MIN_KEY_LENGTH = 15
+    SKIP_PHRASES = [
+        "help was provided", "assistant helped", "conversation was about",
+        "المحادثة كانت حول", "تم تقديم المساعدة", "تم التحقق من",
+        "system was built", "all dependencies", "instructions were sent",
+        "تم بناء النظام", "تم تثبيت جميع", "تم ارسال تعليمات",
+    ]
+
     saved = 0
     for fact in facts:
+        # Quality gate: skip empty or too-short keys
+        key = fact.get("key", "")
+        if not key or len(key.strip()) < MIN_KEY_LENGTH:
+            continue
+
+        # Quality gate: skip generic phrases (with Arabic normalization)
+        def norm(text):
+            text = re.sub(r'[\u064B-\u065F\u0610-\u061A\u0670]', '', text)
+            text = re.sub(r'[إأآٱ]', 'ا', text)
+            text = re.sub(r'ى', 'ي', text)
+            text = re.sub(r'ة', 'ه', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
+
+        normalized_key = norm(key.lower())
+        if any(norm(phrase) in normalized_key for phrase in SKIP_PHRASES):
+            continue
+
         category = fact.get("category", "general")
         if category not in VALID_CATEGORIES:
             category = "general"
@@ -159,8 +263,13 @@ def save_facts(facts, session_id):
             "source": "fact_extractor",
         }
 
+        # File locking to prevent race conditions
         with open(fact_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         saved += 1
 
     return saved

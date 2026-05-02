@@ -18,6 +18,7 @@ import os
 import hashlib
 import time
 import sys
+import fcntl
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -178,29 +179,105 @@ def read_new_facts():
         filepath = os.path.join(FACTS_DIR, filename)
 
         with open(filepath, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    fact = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        fact = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                if "category" not in fact:
-                    fact["category"] = file_category
+                    if "category" not in fact:
+                        fact["category"] = file_category
 
-                # Deduplicate by key text only (not full JSON with timestamp)
-                key = fact.get("key", "").strip()
-                if not key:
-                    continue
-                fact_hash = hashlib.md5(key.encode()).hexdigest()
+                    # Deduplicate by key text only (not full JSON with timestamp)
+                    key = fact.get("key", "").strip()
+                    if not key:
+                        continue
+                    fact_hash = hashlib.md5(key.encode()).hexdigest()
 
-                if fact_hash not in indexed:
-                    new_facts.append(fact)
-                    indexed.add(fact_hash)
+                    if fact_hash not in indexed:
+                        new_facts.append(fact)
+                        indexed.add(fact_hash)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     return new_facts, indexed
+
+# ============================================================
+# Orphan node cleanup — remove fact nodes no longer in JSONL files
+# ============================================================
+
+def collect_all_fact_keys():
+    """Collect all fact keys from JSONL files (the source of truth)."""
+    all_keys = set()
+    if not os.path.exists(FACTS_DIR):
+        return all_keys
+
+    for filename in os.listdir(FACTS_DIR):
+        if not filename.endswith(".jsonl"):
+            continue
+        filepath = os.path.join(FACTS_DIR, filename)
+        with open(filepath, encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        fact = json.loads(line)
+                        key = fact.get("key", "").strip()
+                        if key:
+                            all_keys.add(key)
+                    except json.JSONDecodeError:
+                        continue
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    return all_keys
+
+def remove_orphan_nodes(graph):
+    """Remove fact-type nodes whose content is no longer in any JSONL file.
+    Returns (orphan_count, category_count, orphan_hashes) — hashes must be
+    removed from the tracker so re-added facts aren't blocked."""
+    all_keys = collect_all_fact_keys()
+    if not all_keys:
+        print("  No fact keys in JSONL files — skipping orphan cleanup")
+        return 0, 0, set()
+
+    orphan_nodes = []
+    orphan_hashes = set()
+    for node_id, data in graph.nodes(data=True):
+        if data.get("type") != "fact":
+            continue
+        content = data.get("content", "")
+        if content not in all_keys:
+            # Check aliases too
+            aliases = data.get("aliases", [])
+            if any(alias in all_keys for alias in aliases):
+                continue  # Still referenced
+            orphan_nodes.append(node_id)
+            # Compute hash for tracker cleanup
+            orphan_hashes.add(hashlib.md5(content.encode()).hexdigest())
+
+    for node_id in orphan_nodes:
+        graph.remove_node(node_id)
+
+    # Also remove orphan category/session nodes with no edges
+    removed_cats = 0
+    for node_id in list(graph.nodes()):
+        data = graph.nodes[node_id]
+        if data.get("type") in ("category", "session"):
+            if graph.degree(node_id) == 0:
+                graph.remove_node(node_id)
+                removed_cats += 1
+
+    print(f"  Orphan cleanup: {len(orphan_nodes)} fact nodes + {removed_cats} category/session nodes removed")
+    return len(orphan_nodes), removed_cats, orphan_hashes
 
 # ============================================================
 # Add facts to graph
@@ -289,7 +366,7 @@ def add_facts_to_graph(graph, facts):
                     max(
                         existing.get("importance", 1),
                         importance,
-                    ) + 0  # لا نزيد تلقائياً، فقط نضمن الأعلى
+                    )  # لا نزيد تلقائياً، فقط نضمن الأعلى
                 )
                 existing["seen_count"] = existing.get("seen_count", 1) + 1
                 existing["last_seen_at"] = now
@@ -435,8 +512,15 @@ def main():
     graph = load_or_create_graph()
     print(f"  Existing graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
 
+    # Orphan cleanup BEFORE adding new facts
+    orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
+
     result = read_new_facts()
     new_facts, indexed_hashes = result
+
+    # Clean orphan hashes from tracker so re-added facts aren't blocked
+    if orphan_hashes:
+        indexed_hashes -= orphan_hashes
 
     if not new_facts:
         print("  No new facts to add.")

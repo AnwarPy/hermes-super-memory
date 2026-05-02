@@ -13,6 +13,7 @@ import os
 import re
 import time
 import hashlib
+import fcntl
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -25,10 +26,31 @@ FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
 TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.summarizer_tracker.json")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:7b")
 
 BATCH_SIZE = 5
 MAX_MESSAGES_PER_SESSION = 100
+
+# Minimum fact key length to avoid useless single-word keys
+MIN_FACT_KEY_LENGTH = 15
+
+# ============================================================
+# Arabic normalization for reliable SKIP_PHRASES matching
+# ============================================================
+
+def normalize_arabic(text):
+    """Normalize Arabic text for reliable string matching.
+    Handles: diacritics (تَشكِيل), alef variants, ya/ta, extra spaces."""
+    # Remove diacritics
+    text = re.sub(r'[\u064B-\u065F\u0610-\u061A\u0670]', '', text)
+    # Unify alef
+    text = re.sub(r'[إأآٱ]', 'ا', text)
+    # Unify ya and ta marbuta
+    text = re.sub(r'ى', 'ي', text)
+    text = re.sub(r'ة', 'ه', text)
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 # الجلسة لا تُلخَّص قبل أن تكون "خاملة" (idle) لمدة >= هذه الدقائق منذ آخر رسالة.
 # الهدف: تجنّب تلخيص جلسات لا تزال مفتوحة وقد تُضاف لها رسائل جديدة.
@@ -147,20 +169,60 @@ def get_session_messages(session_id):
     return messages
 
 # ============================================================
-# Parse LLM JSON safely
+# Parse LLM JSON safely — v4: 3-tier robust parser
 # ============================================================
 
-def parse_json_response(content):
+def robust_json_parse(content):
+    """Parse LLM JSON with 3 attempts: direct → extract block → fix errors."""
     content = content.strip()
-    if content.startswith("```"):
-        newline_idx = content.find("\n")
-        if newline_idx != -1:
-            content = content[newline_idx + 1:]
-        last_fence = content.rfind("```")
-        if last_fence != -1:
-            content = content[:last_fence]
-        content = content.strip()
-    return json.loads(content)
+    if not content:
+        return None
+
+    # Attempt 1: Direct parse (after removing markdown fences)
+    cleaned = content
+    if cleaned.startswith("```"):
+        idx = cleaned.find("\n")
+        if idx != -1:
+            cleaned = cleaned[idx + 1:]
+        last = cleaned.rfind("```")
+        if last != -1:
+            cleaned = cleaned[:last]
+        cleaned = cleaned.strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: Extract first JSON object using brace matching
+    brace_count = 0
+    start = -1
+    for i, ch in enumerate(content):
+        if ch == '{':
+            if brace_count == 0:
+                start = i
+            brace_count += 1
+        elif ch == '}':
+            brace_count -= 1
+            if brace_count == 0 and start >= 0:
+                candidate = content[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+
+    # Attempt 3: Fix common JSON errors
+    fixed = cleaned
+    # Replace single quotes with double quotes (naive)
+    fixed = re.sub(r"(?<!['\"])\b(\w+)\b\s*:\s*'([^']*)'", r'"\1": "\2"', fixed)
+    # Remove trailing commas before } or ]
+    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+    # Fix unescaped quotes in strings (rough)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError as e:
+        print(f"  JSON parse failed all 3 attempts: {e}")
+        return None
 
 # ============================================================
 # Summary generation using LOCAL Ollama (with retry)
@@ -193,13 +255,24 @@ def generate_summary(session_id, messages):
     )
 
     prompt = (
-        f"You are a session summarizer. {lang_instruction}\n"
-        "Analyze this conversation and produce:\n"
-        "1. A 3-5 bullet point summary (in the language specified above).\n"
-        "2. Extract important facts as key-value pairs with categories\n\n"
+        f"You are an expert session summarizer and fact extractor. {lang_instruction}\n\n"
+        "TASK 1 — Summary (3-5 bullets):\n"
+        "- Write SPECIFIC, actionable summaries. NOT 'system was built' but 'Built Flask API on port 8080 with SQLite backend'.\n"
+        "- Include concrete details: file paths, versions, URLs, error messages, solutions.\n\n"
+        "TASK 2 — Fact Extraction (key-value pairs with categories):\n"
+        "- ATOMICITY: Each fact = ONE atomic fact ONLY. Split multi-fact sentences.\n"
+        "- Each fact key must be a COMPLETE SENTENCE with SPECIFIC values.\n"
+        "- BAD: 'project_directory' → GOOD: 'Project source code is at /home/anwar/multica-source'\n"
+        "- BAD: 'dependencies_installed' → GOOD: 'Installed pnpm 10.28.2, Node.js 22, Docker, PostgreSQL 17'\n"
+        "- BAD: 'graph contains 13 nodes' → SKIP (snapshot stats, not a lasting fact)\n"
+        "- NO INFERENCE: Extract ONLY explicitly stated info. Never invent versions, paths, or dates.\n"
+        "- PRESERVE LITERALS: Never translate or rephrase paths, commands, package names, versions, branch names.\n"
+        "- BILINGUAL: Extract facts in the SAME language they were discussed. Do NOT translate.\n"
+        "- Exclude: transient stats (node counts, file sizes, timestamps), generic phrases ('help was provided').\n"
+        "- Include: file paths, URLs, API endpoints, versions, config values, user preferences, decisions made, errors fixed.\n\n"
         "Respond ONLY with valid JSON in this exact format:\n"
-        '{"summary": ["point 1", "point 2"], '
-        '"facts": [{"key": "fact", "category": "preference"}], '
+        '{"summary": ["specific point 1", "specific point 2"], '
+        '"facts": [{"key": "complete sentence with specific value", "category": "technical"}], '
         '"language": "ar", "importance": 3}\n\n'
         "Categories: preference, fact, decision, correction, project, technical, personal, service\n\n"
         f"Session conversation:\n{conversation_text}"
@@ -234,8 +307,23 @@ def generate_summary(session_id, messages):
                 result = json.loads(response.read().decode("utf-8"))
 
             content = result.get("message", {}).get("content", "")
-            return parse_json_response(content)
+            return robust_json_parse(content)
 
+        except urllib.error.URLError as e:
+            # Explicit timeout handling
+            if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
+                print(f"  Ollama timeout (attempt {attempt+1}), retrying...")
+                if attempt < max_retries:
+                    continue
+                print(f"  Ollama timeout after {max_retries+1} attempts, skipping session")
+                return None
+            print(f"  Ollama network error: {e}")
+            return None
+        except TimeoutError:
+            print(f"  Ollama timeout (attempt {attempt+1})")
+            if attempt < max_retries:
+                continue
+            return None
         except json.JSONDecodeError as e:
             if attempt < max_retries:
                 print(f"  JSON parse failed (attempt {attempt+1}), retrying...")
@@ -267,6 +355,22 @@ def save_summary(session_id, summary_data):
     facts = summary_data.get("facts", [])
     saved_count = 0
     for fact in facts:
+        # Quality gate: skip facts with empty or too-short keys
+        key = fact.get("key", "")
+        if not key or len(key.strip()) < MIN_FACT_KEY_LENGTH:
+            continue
+
+        # Quality gate: skip generic/useless phrases (with Arabic normalization)
+        skip_phrases = [
+            "help was provided", "assistant helped", "conversation was about",
+            "المحادثة كانت حول", "تم تقديم المساعدة", "تم التحقق من",
+            "system was built", "all dependencies", "instructions were sent",
+            "تم بناء النظام", "تم تثبيت جميع", "تم ارسال تعليمات",
+        ]
+        normalized_key = normalize_arabic(key.lower())
+        if any(normalize_arabic(phrase) in normalized_key for phrase in skip_phrases):
+            continue
+
         category = fact.get("category", "general")
         if category not in VALID_CATEGORIES:
             category = "general"
@@ -281,8 +385,13 @@ def save_summary(session_id, summary_data):
             "source": "session_summarizer",
         }
 
+        # File locking to prevent race conditions with graph_updater
         with open(fact_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(fact_entry, ensure_ascii=False) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(fact_entry, ensure_ascii=False) + "\n")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         saved_count += 1
 
     print(f"  Facts saved: {saved_count}")
