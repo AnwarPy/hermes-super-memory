@@ -559,6 +559,7 @@ def main():
 
     # Persist both new facts AND orphan removal
     save_graph(graph)
+    tracker = load_graph_tracker()
     tracker["indexed_fact_hashes"] = list(indexed_hashes)
     save_graph_tracker(tracker)
 
