@@ -528,6 +528,9 @@ def main():
             current -= orphan_hashes
             tracker["indexed_fact_hashes"] = list(current)
             save_graph_tracker(tracker)
+        # Persist orphan removal to disk
+        if orphan_facts or orphan_others:
+            save_graph(graph)
         return
 
     print(f"  New facts found: {len(new_facts)}")
@@ -541,9 +544,7 @@ def main():
     print(f"  Edges added: {edges_added}")
     print(f"  Embedding time: {elapsed:.1f}s")
 
-    save_graph(graph)
-
-    # Register hashes in tracker ONLY AFTER successful save
+    # Register hashes in tracker ONLY AFTER successful add
     new_hashes = set()
     for fact in new_facts:
         key = fact.get("key", "").strip()
@@ -556,7 +557,8 @@ def main():
     if orphan_hashes:
         indexed_hashes -= orphan_hashes
 
-    tracker = load_graph_tracker()
+    # Persist both new facts AND orphan removal
+    save_graph(graph)
     tracker["indexed_fact_hashes"] = list(indexed_hashes)
     save_graph_tracker(tracker)
 

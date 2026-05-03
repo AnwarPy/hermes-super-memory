@@ -419,7 +419,7 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT typeof(timestamp) FROM messages LIMIT 1")
+        cursor.execute("SELECT typeof(timestamp) FROM messages WHERE timestamp IS NOT NULL LIMIT 1")
         row = cursor.fetchone()
         if row and row[0] not in ("real", "integer"):
             print(f"ERROR: messages.timestamp is stored as '{row[0]}' (expected REAL/integer). "
