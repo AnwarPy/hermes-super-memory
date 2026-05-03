@@ -453,6 +453,7 @@ def main():
     print(f"\nFound {len(sessions)} unsummarized sessions\n")
 
     total_facts = 0
+    summarized_count = 0
 
     for session in sessions:
         sid = session["id"]

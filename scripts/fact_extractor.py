@@ -255,7 +255,7 @@ def save_facts(facts, session_id):
         fact_file = os.path.join(FACTS_DIR, f"{category}.jsonl")
 
         entry = {
-            "key": fact.get("key", ""),
+            "key": fact.get("key", "").strip(),
             "category": category,
             "session_id": session_id,
             "extracted_at": datetime.now(timezone.utc).isoformat(),
