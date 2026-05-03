@@ -114,7 +114,7 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
     # نحسب عتبة "آخر رسالة قبل X دقيقة" — لو آخر رسالة بعد هذا الوقت، الجلسة "نشطة"
     idle_threshold = (
         datetime.now(timezone.utc) - timedelta(minutes=SESSION_IDLE_MINUTES)
-    ).isoformat()
+    ).timestamp()
 
     base_filters = """
         s.message_count >= 2
