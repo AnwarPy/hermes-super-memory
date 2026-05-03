@@ -193,7 +193,9 @@ Categories: preference, fact, decision, correction, project, technical, personal
             parsed = robust_json_parse(content)
             if parsed is None or not isinstance(parsed, dict):
                 return []
-            facts = parsed.get("facts", [])
+            facts = parsed.get("facts") or []
+            if not isinstance(facts, list):
+                facts = []
 
             # Validate categories
             valid_facts = []
@@ -244,8 +246,8 @@ def save_facts(facts, session_id):
         if not isinstance(fact, dict):
             continue
         # Quality gate: skip empty or too-short keys
-        key = (fact.get("key") or "")
-        if not key or len(key.strip()) < MIN_KEY_LENGTH:
+        key = (fact.get("key") or "").strip()
+        if not key or len(key) < MIN_KEY_LENGTH:
             continue
 
         # Quality gate: skip generic phrases (with Arabic normalization)
