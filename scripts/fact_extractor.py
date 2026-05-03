@@ -185,7 +185,7 @@ Categories: preference, fact, decision, correction, project, technical, personal
 
             content = result.get("message", {}).get("content", "")
             parsed = robust_json_parse(content)
-            if parsed is None:
+            if parsed is None or not isinstance(parsed, dict):
                 return []
             facts = parsed.get("facts", [])
 

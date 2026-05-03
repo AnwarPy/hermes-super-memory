@@ -478,6 +478,10 @@ def main():
             print("  Failed to generate summary, skipping")
             continue
 
+        if not isinstance(summary, dict):
+            print("  Invalid summary format (not a dict), skipping")
+            continue
+
         if not isinstance(summary.get("summary"), list):
             print("  Invalid summary format (no summary list), skipping")
             continue
