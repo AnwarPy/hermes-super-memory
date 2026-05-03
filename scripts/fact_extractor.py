@@ -130,12 +130,18 @@ def extract_facts_from_summary(summary_data):
     """Use local LLM to extract deeper facts."""
     import urllib.request
 
-    summary_points = summary_data.get("summary", [])
-    existing_facts = summary_data.get("facts", [])
+    summary_points = summary_data.get("summary") or []
+    if not isinstance(summary_points, list):
+        summary_points = []
+    existing_facts = summary_data.get("facts") or []
+    if not isinstance(existing_facts, list):
+        existing_facts = []
     session_id = summary_data.get("session_id", "")
 
     summary_text = "\n".join(f"- {s}" for s in summary_points)
-    existing_text = "\n".join(f"- {f.get('key', '')}" for f in existing_facts)
+    existing_text = "\n".join(
+        f"- {f.get('key', '')}" for f in existing_facts if isinstance(f, dict)
+    )
 
     prompt = f"""Given this session summary and existing facts, extract ADDITIONAL deeper facts.
 

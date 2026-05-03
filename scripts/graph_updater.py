@@ -208,11 +208,14 @@ def read_new_facts():
                     except json.JSONDecodeError:
                         continue
 
+                    if not isinstance(fact, dict):
+                        continue
+
                     if "category" not in fact:
                         fact["category"] = file_category
 
                     # Deduplicate by key text only (not full JSON with timestamp)
-                    key = fact.get("key", "").strip()
+                    key = (fact.get("key") or "").strip()
                     if not key:
                         continue
                     fact_hash = hashlib.md5(key.encode()).hexdigest()
@@ -250,7 +253,9 @@ def collect_all_fact_keys():
                         continue
                     try:
                         fact = json.loads(line)
-                        key = fact.get("key", "").strip()
+                        if not isinstance(fact, dict):
+                            continue
+                        key = (fact.get("key") or "").strip()
                         if key:
                             all_keys.add(key)
                     except json.JSONDecodeError:
@@ -349,7 +354,7 @@ def add_facts_to_graph(graph, facts):
             cat_embeddings[cat_id] = get_embedding(f"Category: {cat}")
 
     for fact in facts:
-        key = fact.get("key", "").strip()
+        key = (fact.get("key") or "").strip()
         category = fact.get("category", "general")
         if category not in VALID_CATEGORIES:
             category = "general"
@@ -567,7 +572,7 @@ def main():
     # Register hashes in tracker ONLY AFTER successful add
     new_hashes = set()
     for fact in new_facts:
-        key = fact.get("key", "").strip()
+        key = (fact.get("key") or "").strip()
         if key:
             new_hashes.add(hashlib.md5(key.encode()).hexdigest())
     indexed_hashes.update(new_hashes)
