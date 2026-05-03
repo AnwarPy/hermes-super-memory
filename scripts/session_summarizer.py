@@ -127,7 +127,11 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
     """
 
     if summarized:
-        placeholders = ",".join(["?" for _ in summarized])
+        # Cap to 500 most recent to avoid SQLITE_LIMIT_VARIABLE_NUMBER (32766/999)
+        # 500 is more than enough since we only fetch BATCH_SIZE=5 new sessions
+        MAX_IN_LIST = 500
+        capped = summarized[-MAX_IN_LIST:]
+        placeholders = ",".join(["?" for _ in capped])
         query = f"""
             SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count, s.title
             FROM sessions s
@@ -136,7 +140,7 @@ def get_unsummarized_sessions(limit=BATCH_SIZE):
             ORDER BY s.started_at DESC
             LIMIT ?
         """
-        cursor.execute(query, summarized + [idle_threshold, limit])
+        cursor.execute(query, capped + [idle_threshold, limit])
     else:
         query = f"""
             SELECT s.id, s.source, s.started_at, s.ended_at, s.message_count, s.title
@@ -409,6 +413,23 @@ def main():
     if not os.path.exists(DB_PATH):
         print(f"ERROR: Database not found: {DB_PATH}")
         return
+
+    # Sanity check: verify messages.timestamp is stored as REAL (Unix epoch)
+    # If stored as TEXT (ISO strings), the idle_threshold comparison will silently fail
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT typeof(timestamp) FROM messages LIMIT 1")
+        row = cursor.fetchone()
+        if row and row[0] not in ("real", "integer"):
+            print(f"ERROR: messages.timestamp is stored as '{row[0]}' (expected REAL/integer). "
+                  f"The idle session filter will not work correctly. "
+                  f"Run: UPDATE messages SET timestamp = strftime('%s', timestamp) * 1.0;")
+            conn.close()
+            return
+    except sqlite3.OperationalError as e:
+        print(f"WARNING: Could not verify timestamp schema: {e}")
+    conn.close()
 
     import urllib.request
     try:

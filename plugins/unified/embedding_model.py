@@ -185,7 +185,7 @@ class EmbeddingModel:
         v1 = np.array(emb1)
         v2 = np.array(emb2)
         
-        similarity = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        similarity = np.dot(v1, v2) / max(np.linalg.norm(v1) * np.linalg.norm(v2), 1e-10)
         return float(similarity)
     
     def get_model_info(self) -> dict:

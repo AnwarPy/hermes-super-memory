@@ -10,7 +10,7 @@ Hermes Memory Graph Updater — تحديث الرسم المعرفي للحقا�
 
 الموديلات:
 - BGE-M3 (1024-dim) — نفس unified plugin
-- Ollama qwen2.5:3b — للتلخيص (في session_summarizer)
+- Ollama qwen2.5:7b — للتلخيص (في session_summarizer)
 """
 
 import json
@@ -201,7 +201,9 @@ def read_new_facts():
 
                     if fact_hash not in indexed:
                         new_facts.append(fact)
-                        indexed.add(fact_hash)
+                        # NOTE: Do NOT mark hash as indexed here. The hash is registered
+                        # in main() ONLY after add_facts_to_graph succeeds. This prevents
+                        # silent data loss if embedding or graph insertion fails.
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -512,18 +514,20 @@ def main():
     graph = load_or_create_graph()
     print(f"  Existing graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
 
-    # Orphan cleanup BEFORE adding new facts
-    orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
-
+    # Read new facts FIRST (before orphan cleanup, so dedup has full graph)
     result = read_new_facts()
     new_facts, indexed_hashes = result
 
-    # Clean orphan hashes from tracker so re-added facts aren't blocked
-    if orphan_hashes:
-        indexed_hashes -= orphan_hashes
-
     if not new_facts:
         print("  No new facts to add.")
+        # Still run orphan cleanup even if no new facts
+        orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
+        if orphan_hashes:
+            tracker = load_graph_tracker()
+            current = set(tracker.get("indexed_fact_hashes", []))
+            current -= orphan_hashes
+            tracker["indexed_fact_hashes"] = list(current)
+            save_graph_tracker(tracker)
         return
 
     print(f"  New facts found: {len(new_facts)}")
@@ -538,6 +542,19 @@ def main():
     print(f"  Embedding time: {elapsed:.1f}s")
 
     save_graph(graph)
+
+    # Register hashes in tracker ONLY AFTER successful save
+    new_hashes = set()
+    for fact in new_facts:
+        key = fact.get("key", "").strip()
+        if key:
+            new_hashes.add(hashlib.md5(key.encode()).hexdigest())
+    indexed_hashes.update(new_hashes)
+
+    # Orphan cleanup AFTER adding — dedup had full graph
+    orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
+    if orphan_hashes:
+        indexed_hashes -= orphan_hashes
 
     tracker = load_graph_tracker()
     tracker["indexed_fact_hashes"] = list(indexed_hashes)
