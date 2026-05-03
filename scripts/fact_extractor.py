@@ -190,11 +190,15 @@ Categories: preference, fact, decision, correction, project, technical, personal
             facts = parsed.get("facts", [])
 
             # Validate categories
+            valid_facts = []
             for f in facts:
+                if not isinstance(f, dict):
+                    continue
                 if f.get("category") not in VALID_CATEGORIES:
                     f["category"] = "general"
+                valid_facts.append(f)
 
-            return facts
+            return valid_facts
 
         except urllib.error.URLError as e:
             if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
@@ -231,8 +235,10 @@ def save_facts(facts, session_id):
 
     saved = 0
     for fact in facts:
+        if not isinstance(fact, dict):
+            continue
         # Quality gate: skip empty or too-short keys
-        key = fact.get("key", "")
+        key = (fact.get("key") or "")
         if not key or len(key.strip()) < MIN_KEY_LENGTH:
             continue
 
@@ -255,7 +261,7 @@ def save_facts(facts, session_id):
         fact_file = os.path.join(FACTS_DIR, f"{category}.jsonl")
 
         entry = {
-            "key": fact.get("key", "").strip(),
+            "key": (fact.get("key") or "").strip(),
             "category": category,
             "session_id": session_id,
             "extracted_at": datetime.now(timezone.utc).isoformat(),

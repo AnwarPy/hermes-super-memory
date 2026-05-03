@@ -361,8 +361,10 @@ def save_summary(session_id, summary_data):
         facts = []
     saved_count = 0
     for fact in facts:
+        if not isinstance(fact, dict):
+            continue
         # Quality gate: skip facts with empty or too-short keys
-        key = fact.get("key", "").strip()
+        key = (fact.get("key") or "").strip()
         if not key or len(key) < MIN_FACT_KEY_LENGTH:
             continue
 
