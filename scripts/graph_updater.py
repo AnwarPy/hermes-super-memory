@@ -103,10 +103,31 @@ def load_or_create_graph():
 
     graph_path = os.path.join(GRAPHS_DIR, PROJECT_NAME, "graph.json")
     if os.path.exists(graph_path):
-        with open(graph_path) as f:
-            data = json.load(f)
-        return nx.node_link_graph(data)
+        try:
+            with open(graph_path) as f:
+                data = json.load(f)
+            return nx.node_link_graph(data)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  CORRUPT graph.json ({e}) — starting from empty graph")
+            # Backup corrupted file for manual recovery
+            backup = graph_path + f".corrupt.{int(time.time())}"
+            try:
+                import shutil
+                shutil.copy2(graph_path, backup)
+                print(f"  Backed up corrupt file to: {backup}")
+            except:
+                pass
+            return nx.Graph()
     return nx.Graph()
+
+def _atomic_json_write(path, data):
+    """Write JSON atomically via tmp + fsync + os.replace."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 def save_graph(graph):
     import networkx as nx
@@ -121,16 +142,15 @@ def save_graph(graph):
         try:
             with open(meta_path) as f:
                 existing_meta = json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError):
             pass
 
-    # Save graph (compact)
+    # Save graph (atomic)
     graph_path = os.path.join(project_dir, "graph.json")
     graph_data = nx.node_link_data(graph)
-    with open(graph_path, "w", encoding="utf-8") as f:
-        json.dump(graph_data, f, ensure_ascii=False, separators=(",", ":"))
+    _atomic_json_write(graph_path, graph_data)
 
-    # Save metadata
+    # Save metadata (atomic)
     metadata = {
         "project_name": PROJECT_NAME,
         "created_at": existing_meta.get("created_at", datetime.now(timezone.utc).isoformat()),
@@ -140,21 +160,19 @@ def save_graph(graph):
         "embedding_model": "BAAI/bge-m3",
         "embedding_dim": EMBEDDING_DIM,
     }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, separators=(",", ":"))
+    _atomic_json_write(meta_path, metadata)
 
-    # Save communities (by category)
+    # Save communities (atomic)
     communities = {}
     for node, data in graph.nodes(data=True):
         cat = data.get("category", "general")
         communities.setdefault(cat, []).append(node)
 
     comm_path = os.path.join(project_dir, "communities.json")
-    with open(comm_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "communities": communities,
-            "num_communities": len(communities),
-        }, f, ensure_ascii=False, separators=(",", ":"))
+    _atomic_json_write(comm_path, {
+        "communities": communities,
+        "num_communities": len(communities),
+    })
 
     print(f"  Graph saved: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
 
@@ -263,8 +281,10 @@ def remove_orphan_nodes(graph):
             if any(alias in all_keys for alias in aliases):
                 continue  # Still referenced
             orphan_nodes.append(node_id)
-            # Compute hash for tracker cleanup
+            # Compute hash for tracker cleanup (content + all aliases)
             orphan_hashes.add(hashlib.md5(content.encode()).hexdigest())
+            for alias in data.get("aliases", []):
+                orphan_hashes.add(hashlib.md5(alias.encode()).hexdigest())
 
     for node_id in orphan_nodes:
         graph.remove_node(node_id)
@@ -329,7 +349,7 @@ def add_facts_to_graph(graph, facts):
             cat_embeddings[cat_id] = get_embedding(f"Category: {cat}")
 
     for fact in facts:
-        key = fact.get("key", "")
+        key = fact.get("key", "").strip()
         category = fact.get("category", "general")
         if category not in VALID_CATEGORIES:
             category = "general"

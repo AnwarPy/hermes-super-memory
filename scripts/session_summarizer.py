@@ -357,11 +357,13 @@ def save_summary(session_id, summary_data):
     print(f"  Summary saved: {summary_file}")
 
     facts = summary_data.get("facts", [])
+    if not isinstance(facts, list):
+        facts = []
     saved_count = 0
     for fact in facts:
         # Quality gate: skip facts with empty or too-short keys
-        key = fact.get("key", "")
-        if not key or len(key.strip()) < MIN_FACT_KEY_LENGTH:
+        key = fact.get("key", "").strip()
+        if not key or len(key) < MIN_FACT_KEY_LENGTH:
             continue
 
         # Quality gate: skip generic/useless phrases (with Arabic normalization)
@@ -381,7 +383,7 @@ def save_summary(session_id, summary_data):
         fact_file = os.path.join(FACTS_DIR, f"{category}.jsonl")
 
         fact_entry = {
-            "key": fact.get("key", ""),
+            "key": key,
             "category": category,
             "session_id": session_id,
             "extracted_at": datetime.now(timezone.utc).isoformat(),
@@ -450,7 +452,6 @@ def main():
 
     print(f"\nFound {len(sessions)} unsummarized sessions\n")
 
-    summarized_ids = []
     total_facts = 0
 
     for session in sessions:
@@ -480,15 +481,16 @@ def main():
 
         n_facts = save_summary(sid, summary)
         total_facts += n_facts
-        summarized_ids.append(sid)
+        summarized_count += 1
 
-    if summarized_ids:
+        # Persist tracker immediately per-session — crash-safe, no re-summarize
         tracker = load_tracker()
-        tracker["summarized_sessions"] = list(set(
-            tracker["summarized_sessions"] + summarized_ids
-        ))
-        save_tracker(tracker)
-        print(f"\n✓ Summarized {len(summarized_ids)} sessions, {total_facts} facts total")
+        if sid not in tracker["summarized_sessions"]:
+            tracker["summarized_sessions"].append(sid)
+            save_tracker(tracker)
+
+    if summarized_count:
+        print(f"\n✓ Summarized {summarized_count} sessions, {total_facts} facts total")
     else:
         print("\nNo sessions were successfully summarized.")
 
