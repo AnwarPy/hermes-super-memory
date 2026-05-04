@@ -543,6 +543,29 @@ def main():
     result = read_new_facts()
     new_facts, indexed_hashes = result
 
+    # Self-heal: purge stale hashes from tracker that no longer exist on disk
+    all_jsonl_hashes = set()
+    for filename in os.listdir(FACTS_DIR):
+        if not filename.endswith(".jsonl"):
+            continue
+        filepath = os.path.join(FACTS_DIR, filename)
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    fact = json.loads(line)
+                    key = (fact.get("key") or "").strip()
+                    if key:
+                        all_jsonl_hashes.add(hashlib.md5(key.encode()).hexdigest())
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+    stale = indexed_hashes - all_jsonl_hashes
+    if stale:
+        indexed_hashes -= stale
+        print(f"  Self-heal: removed {len(stale)} stale tracker hashes")
+
     if not new_facts:
         print("  No new facts to add.")
         # Still run orphan cleanup even if no new facts

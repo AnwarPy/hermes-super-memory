@@ -101,6 +101,8 @@ def load_tracker():
     return {"processed_summaries": []}
 
 def save_tracker(tracker):
+    # Ensure backward-compat alias for reports
+    tracker.setdefault("extracted_sessions", list(tracker.get("processed_summaries", [])))
     tmp = EXTRACTOR_TRACKER + ".tmp"
     with open(tmp, "w") as f:
         json.dump(tracker, f, indent=2)
