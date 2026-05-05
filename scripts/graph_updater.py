@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Hermes Memory Graph Updater — تحديث الرسم المعرفي للحقائق
+Hermes Memory Graph Updater — SQLite Edition
 
-يقرأ الحقائق من ~/.hermes/memory/facts_auto/
-يضيفها لـ ~/.hermes/graphs/hermes-memory/
-باستخدام BGE-M3 (نفس نموذج التضمين في النظام الأساسي)
+يحل محل NetworkX بالكامل:
+- القراءة من SQLite للـ dedup الدلالي.
+- الكتابة مباشرة إلى facts + fact_relations + processing_state.
+- دعم MEM0_DECISION (P2) عبر memory_decision.py (يستخدم SQLite أيضاً).
+- تنظيف العقد اليتيمة عبر SQL queries.
 
-هذا يضمن أن prefetch() يجد الحقائق تلقائياً.
-
-الموديلات:
-- BGE-M3 (1024-dim) — نفس unified plugin
-- Ollama qwen2.5:7b — للتلخيص (في session_summarizer)
+التبعيات: db.py, quality_gates.py, memory_decision.py (اختياري).
+تمت إزالة: networkx, graph.json, graph_tracker.json بالكامل.
 """
 
 import json
@@ -19,29 +18,26 @@ import hashlib
 import time
 import sys
 import fcntl
+import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
 
-# P0: Import unified quality gates
-_qg_dir = str(Path(__file__).parent)
-if _qg_dir not in sys.path:
-    sys.path.insert(0, _qg_dir)
+# P0: Import unified quality gates + db + migrate helpers
+_script_dir = str(Path(__file__).parent)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 from quality_gates import normalize_arabic_text, is_junk_fact
+from db import MemoryDB, pack_embedding, EMBEDDING_DIM, get_db
 
 # ============================================================
 # Configuration
 # ============================================================
 FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
-GRAPHS_DIR = os.path.expanduser("~/.hermes/graphs")
+DB_PATH = os.path.expanduser("~/.hermes/memory/hermes_memory.db")
 PROJECT_NAME = "hermes-memory"
-TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.graph_tracker.json")
-
-EMBEDDING_DIM = 1024  # BGE-M3 dimension
 
 # عتبة التشابه الدلالي للكشف عن التكرار (cosine similarity)
-# 0.92 = الحقيقة الجديدة شبه مطابقة لحقيقة موجودة (إعادة صياغة)
-# 0.95+ صارمة جداً، 0.85- متساهلة جداً وتدمج حقائق متمايزة
-# تجاوز هذه العتبة → تحديث الموجود بدلاً من إضافة جديد
 SEMANTIC_DEDUP_THRESHOLD = 0.88
 
 VALID_CATEGORIES = (
@@ -50,30 +46,8 @@ VALID_CATEGORIES = (
 )
 
 # ============================================================
-# Tracker
-# ============================================================
-
-def load_graph_tracker():
-    if os.path.exists(TRACKER_FILE):
-        try:
-            with open(TRACKER_FILE) as f:
-                data = json.load(f)
-            if isinstance(data.get("indexed_fact_hashes"), list):
-                return data
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return {"indexed_fact_hashes": []}
-
-def save_graph_tracker(tracker):
-    tmp = TRACKER_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(tracker, f, indent=2)
-    os.replace(tmp, TRACKER_FILE)
-
-# ============================================================
 # BGE-M3 Embedding (from unified plugin)
 # ============================================================
-
 _embedding_model = None
 
 def get_embedding_model():
@@ -101,104 +75,23 @@ def get_embedding(text):
     return model.embed_query(text)
 
 # ============================================================
-# Load/save graph
+# Read new facts from JSONL (Dual-Write source of truth)
 # ============================================================
 
-def load_or_create_graph():
-    import networkx as nx
+def read_new_facts(db: MemoryDB):
+    """
+    يقرأ الحقائق الجديدة من JSONL.
+    يتتبع الحقائق المُفهرسة عبر db.processing_state بدلاً من graph_tracker.json.
+    """
+    # Load tracked hashes from SQLite (migrated from tracker)
+    tracker_json = db.get_state('tracker_hashes') or '[]'
+    indexed_hashes = set(json.loads(tracker_json))
 
-    graph_path = os.path.join(GRAPHS_DIR, PROJECT_NAME, "graph.json")
-    if os.path.exists(graph_path):
-        try:
-            with open(graph_path) as f:
-                data = json.load(f)
-            return nx.node_link_graph(data)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"  CORRUPT graph.json ({e}) — starting from empty graph")
-            # Backup corrupted file for manual recovery
-            backup = graph_path + f".corrupt.{int(time.time())}"
-            try:
-                import shutil
-                shutil.copy2(graph_path, backup)
-                print(f"  Backed up corrupt file to: {backup}")
-            except:
-                pass
-            return nx.Graph()
-    return nx.Graph()
-
-def _atomic_json_write(path, data):
-    """Write JSON atomically via tmp + fsync + os.replace."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-def save_graph(graph):
-    import networkx as nx
-
-    project_dir = os.path.join(GRAPHS_DIR, PROJECT_NAME)
-    os.makedirs(project_dir, exist_ok=True)
-
-    # Preserve created_at
-    meta_path = os.path.join(project_dir, "metadata.json")
-    existing_meta = {}
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path) as f:
-                existing_meta = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Save graph (atomic)
-    graph_path = os.path.join(project_dir, "graph.json")
-    graph_data = nx.node_link_data(graph)
-    _atomic_json_write(graph_path, graph_data)
-
-    # Save metadata (atomic)
-    metadata = {
-        "project_name": PROJECT_NAME,
-        "created_at": existing_meta.get("created_at", datetime.now(timezone.utc).isoformat()),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "num_nodes": graph.number_of_nodes(),
-        "num_edges": graph.number_of_edges(),
-        "embedding_model": "BAAI/bge-m3",
-        "embedding_dim": EMBEDDING_DIM,
-    }
-    _atomic_json_write(meta_path, metadata)
-
-    # Save category index (P4: renamed from communities.json — these are categories, not Leiden communities)
-    categories = {}
-    for node, data in graph.nodes(data=True):
-        cat = data.get("category", "general")
-        categories.setdefault(cat, []).append(node)
-
-    cat_path = os.path.join(project_dir, "category_index.json")
-    _atomic_json_write(cat_path, {
-        "categories": categories,
-        "num_categories": len(categories),
-    })
-    # Backward compat: keep communities.json as symlink/copy for any readers still looking for it
-    _atomic_json_write(os.path.join(project_dir, "communities.json"), {
-        "categories": categories,
-        "num_categories": len(categories),
-    })
-
-    print(f"  Graph saved: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
-
-# ============================================================
-# Read new facts
-# ============================================================
-
-def read_new_facts():
-    tracker = load_graph_tracker()
-    indexed = set(tracker.get("indexed_fact_hashes", []))
     new_facts = []
 
     if not os.path.exists(FACTS_DIR):
         os.makedirs(FACTS_DIR, exist_ok=True)
-        return new_facts, indexed
+        return new_facts, indexed_hashes
 
     for filename in os.listdir(FACTS_DIR):
         if not filename.endswith(".jsonl"):
@@ -238,21 +131,22 @@ def read_new_facts():
                     key_normalized = normalize_arabic_text(key)
                     fact_hash = hashlib.md5(key_normalized.encode()).hexdigest()
 
-                    if fact_hash not in indexed:
+                    if fact_hash not in indexed_hashes:
                         new_facts.append(fact)
                         # NOTE: Do NOT mark hash as indexed here. The hash is registered
-                        # in main() ONLY after add_facts_to_graph succeeds. This prevents
+                        # in main() ONLY after add_facts_to_db succeeds. This prevents
                         # silent data loss if embedding or graph insertion fails.
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-    return new_facts, indexed
+    return new_facts, indexed_hashes
+
 
 # ============================================================
 # Orphan node cleanup — remove fact nodes no longer in JSONL files
 # ============================================================
 
-def collect_all_fact_keys():
+def collect_all_fact_keys() -> set:
     """Collect all fact keys from JSONL files (the source of truth)."""
     all_keys = set()
     if not os.path.exists(FACTS_DIR):
@@ -283,86 +177,95 @@ def collect_all_fact_keys():
 
     return all_keys
 
-def remove_orphan_nodes(graph):
-    """Remove fact-type nodes whose content is no longer in any JSONL file.
-    Returns (orphan_count, category_count, orphan_hashes) — hashes must be
-    removed from the tracker so re-added facts aren't blocked."""
+def remove_orphan_nodes(db: MemoryDB):
+    """
+    Remove facts from SQLite that no longer exist in JSONL files.
+    Returns (orphan_count, orphan_hashes) for tracker cleanup.
+    """
     all_keys = collect_all_fact_keys()
     if not all_keys:
         print("  No fact keys in JSONL files — skipping orphan cleanup")
-        return 0, 0, set()
+        return 0, set()
 
-    orphan_nodes = []
+    # Get all live facts from DB
+    conn = db._get_conn()
+    rows = conn.execute(
+        "SELECT id, full_key FROM facts WHERE valid_to IS NULL"
+    ).fetchall()
+
+    orphan_ids = []
     orphan_hashes = set()
-    for node_id, data in graph.nodes(data=True):
-        if data.get("type") != "fact":
-            continue
-        content = data.get("content", "")
-        if content not in all_keys:
-            # Check aliases too
-            aliases = data.get("aliases", [])
-            if any(alias in all_keys for alias in aliases):
-                continue  # Still referenced
-            orphan_nodes.append(node_id)
-            # Compute hash for tracker cleanup (content + all aliases)
+
+    for row in rows:
+        fact_id, content = row[0], row[1]
+        # Check aliases too
+        aliases_json = db.get_state(f'fact_{fact_id}_aliases') or '[]'
+        aliases = json.loads(aliases_json) if aliases_json else []
+        
+        if content not in all_keys and not any(a in all_keys for a in aliases):
+            orphan_ids.append(fact_id)
             orphan_hashes.add(hashlib.md5(content.encode()).hexdigest())
-            for alias in data.get("aliases", []):
+            for alias in aliases:
                 orphan_hashes.add(hashlib.md5(alias.encode()).hexdigest())
 
-    for node_id in orphan_nodes:
-        graph.remove_node(node_id)
+    # Invalidate orphans (soft delete)
+    for fact_id in orphan_ids:
+        db.invalidate_fact(fact_id)
 
-    # Also remove orphan category/session nodes with no edges
-    removed_cats = 0
-    for node_id in list(graph.nodes()):
-        data = graph.nodes[node_id]
-        if data.get("type") in ("category", "session"):
-            if graph.degree(node_id) == 0:
-                graph.remove_node(node_id)
-                removed_cats += 1
+    # Clean up orphan relations
+    if orphan_ids:
+        conn.execute(
+            f"DELETE FROM fact_relations WHERE from_id IN ({','.join('?'*len(orphan_ids))}) OR to_id IN ({','.join('?'*len(orphan_ids))})",
+            orphan_ids + orphan_ids
+        )
+        conn.commit()
 
-    print(f"  Orphan cleanup: {len(orphan_nodes)} fact nodes + {removed_cats} category/session nodes removed")
-    return len(orphan_nodes), removed_cats, orphan_hashes
+    print(f"  Orphan cleanup: {len(orphan_ids)} facts invalidated")
+    return len(orphan_ids), orphan_hashes
+
 
 # ============================================================
-# Add facts to graph
+# Add facts to SQLite (replaces add_facts_to_graph)
 # ============================================================
 
 def _node_id(text):
     return hashlib.md5(text.encode()).hexdigest()[:12]
 
-def add_facts_to_graph(graph, facts):
-    import numpy as np
-
-    now = datetime.now(timezone.utc).isoformat()
+def add_facts_to_db(db: MemoryDB, facts: list):
+    """
+    إضافة الحقائق إلى SQLite مع dedup دلالي.
+    
+    Returns: (nodes_added, relations_added, nodes_merged)
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_ts = time.time()
     nodes_added = 0
-    edges_added = 0
+    relations_added = 0
     nodes_merged = 0
-    new_node_ids = []
+    new_fact_ids = []
 
     # ====================================================
-    # Pre-build matrix of existing fact embeddings for dedup
+    # Pre-load all existing embeddings for dedup
     # ====================================================
-    existing_fact_nodes = []  # list of (node_id, normalized_embedding)
-    existing_fact_matrix = None
-    
-    for nid, ndata in graph.nodes(data=True):
-        if ndata.get("type") != "fact":
-            continue
-        emb = ndata.get("embedding")
-        if emb and len(emb) == EMBEDDING_DIM:
-            existing_fact_nodes.append(nid)
-    
-    if existing_fact_nodes:
-        raw_matrix = np.asarray(
-            [graph.nodes[nid]["embedding"] for nid in existing_fact_nodes],
-            dtype=np.float32,
-        )
+    conn = db._get_conn()
+    existing_rows = conn.execute(
+        "SELECT id, embedding FROM facts WHERE valid_to IS NULL AND embedding IS NOT NULL"
+    ).fetchall()
+
+    existing_ids = []
+    existing_matrix = None
+
+    if existing_rows:
+        from db import unpack_embedding
+        embs = [unpack_embedding(r[1]) for r in existing_rows]
+        existing_ids = [r[0] for r in existing_rows]
+        raw_matrix = np.asarray(embs, dtype=np.float32)
         norms = np.linalg.norm(raw_matrix, axis=1, keepdims=True)
-        existing_fact_matrix = raw_matrix / np.maximum(norms, 1e-10)
+        existing_matrix = raw_matrix / np.maximum(norms, 1e-10)
 
-    # P2: category nodes now have embedding=None — no pre-generation needed
-
+    # ====================================================
+    # Process each fact
+    # ====================================================
     for fact in facts:
         key = (fact.get("key") or "").strip()
         category = fact.get("category", "general")
@@ -376,174 +279,121 @@ def add_facts_to_graph(graph, facts):
 
         node_id = f"fact_{_node_id(key)}"
 
-        if graph.has_node(node_id):
-            # نفس الـ key بالحرف — تخطّي تماماً (السلوك القديم)
-            target_node_id = node_id
+        # ====================================================
+        # Semantic dedup: ابحث عن fact موجود متشابه دلالياً
+        # ====================================================
+        duplicate_of = None
+        key_for_embedding = normalize_arabic_text(key)
+        embedding = get_embedding(key_for_embedding)
+
+        if existing_matrix is not None and len(existing_matrix) > 0:
+            q = np.asarray(embedding, dtype=np.float32)
+            q = q / max(np.linalg.norm(q), 1e-10)
+            sims = existing_matrix @ q
+            max_idx = int(np.argmax(sims))
+            max_sim = float(sims[max_idx])
+            if max_sim >= SEMANTIC_DEDUP_THRESHOLD:
+                duplicate_of = existing_ids[max_idx]
+
+        if duplicate_of is not None:
+            # دمج: عزّز الموجود بدلاً من إنشاء نود جديد
+            conn.execute(
+                """UPDATE facts 
+                   SET importance = MAX(importance, ?),
+                       seen_count = seen_count + 1,
+                       last_seen_at = ?
+                   WHERE id = ?""",
+                (importance, now_ts, duplicate_of)
+            )
+            # احفظ الصياغة البديلة (مفيد للسياق)
+            existing_aliases_json = db.get_state(f'fact_{duplicate_of}_aliases') or '[]'
+            existing_aliases = json.loads(existing_aliases_json)
+            if key not in existing_aliases:
+                existing_aliases.append(key)
+                db.set_state(f'fact_{duplicate_of}_aliases', json.dumps(existing_aliases[:10], ensure_ascii=False))
+            nodes_merged += 1
         else:
-            # P0-1: Normalize key before embedding — ensures Arabic facts get same embedding
-            key_for_embedding = normalize_arabic_text(key)
-            embedding = get_embedding(key_for_embedding)
-
-            # ====================================================
-            # Semantic dedup: ابحث عن fact موجود متشابه دلالياً
-            # ====================================================
-            duplicate_of = None
-            if existing_fact_matrix is not None and len(existing_fact_matrix) > 0:
-                q = np.asarray(embedding, dtype=np.float32)
-                q = q / max(np.linalg.norm(q), 1e-10)
-                sims = existing_fact_matrix @ q
-                max_idx = int(np.argmax(sims))
-                max_sim = float(sims[max_idx])
-                if max_sim >= SEMANTIC_DEDUP_THRESHOLD:
-                    duplicate_of = existing_fact_nodes[max_idx]
-
-            if duplicate_of is not None:
-                # دمج: عزّز الموجود بدلاً من إنشاء نود جديد
-                existing = graph.nodes[duplicate_of]
-                existing["importance"] = min(
-                    5,
-                    max(
-                        existing.get("importance", 1),
-                        importance,
-                    )  # لا نزيد تلقائياً، فقط نضمن الأعلى
-                )
-                existing["seen_count"] = existing.get("seen_count", 1) + 1
-                existing["last_seen_at"] = now
-                # احفظ الصياغة البديلة (مفيد للسياق)
-                aliases = existing.get("aliases", [])
-                if key not in aliases and key != existing.get("content"):
-                    aliases.append(key)
-                    existing["aliases"] = aliases[:10]  # حد أقصى 10 صياغات
-                target_node_id = duplicate_of
-                nodes_merged += 1
-            else:
-                # P2: Mem0-style decision loop (optional, controlled by env var)
-                # Only triggered when semantic dedup didn't catch it
-                decision_made = False
-                if os.getenv("MEM0_DECISION", "0") == "1":
-                    try:
-                        import importlib.util
-                        _md_path = Path(__file__).parent / "memory_decision.py"
-                        if _md_path.exists():
-                            spec = importlib.util.spec_from_file_location("memory_decision", _md_path)
-                            md = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(md)
-                            
-                            node_ids, embeddings, contents = md.load_graph()
-                            similar = md.find_similar_facts(key, node_ids, embeddings, contents, top_k=3)
-                            if similar:
-                                decision, target, reason = md.decide(fact, similar)
-                                if decision == "noop":
-                                    # Already known — skip
-                                    target_node_id = target
-                                    nodes_merged += 1
-                                    decision_made = True
-                                    print(f"    NOOP: {key[:60]}... ({reason[:80]})")
-                                elif decision == "update":
-                                    # Refinement — merge into existing
-                                    if target and graph.has_node(target):
-                                        existing = graph.nodes[target]
-                                        existing["importance"] = max(existing.get("importance", 1), importance)
-                                        existing["seen_count"] = existing.get("seen_count", 1) + 1
-                                        existing["last_seen_at"] = now
-                                        aliases = existing.get("aliases", [])
-                                        if key not in aliases and key != existing.get("content"):
-                                            aliases.append(key)
-                                            existing["aliases"] = aliases[:10]
-                                        target_node_id = target
-                                        nodes_merged += 1
+            # P2: Mem0-style decision loop (optional, controlled by env var)
+            decision_made = False
+            if os.getenv("MEM0_DECISION", "0") == "1":
+                try:
+                    import importlib.util
+                    _md_path = Path(__file__).parent / "memory_decision.py"
+                    if _md_path.exists():
+                        spec = importlib.util.spec_from_file_location("memory_decision", _md_path)
+                        md = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(md)
+                        
+                        # P2: memory_decision now uses SQLite
+                        similar = md.find_similar_facts(key, top_k=3)
+                        if similar:
+                            decision, target, reason = md.decide(fact, similar)
+                            if decision == "noop":
+                                nodes_merged += 1
+                                decision_made = True
+                                print(f"    NOOP: {key[:60]}... ({reason[:80]})")
+                            elif decision in ("update", "contradict"):
+                                if target:
+                                    # Handle update/contradict via db
+                                    if decision == "update":
+                                        conn.execute(
+                                            """UPDATE facts 
+                                               SET importance = MAX(importance, ?),
+                                                   seen_count = seen_count + 1,
+                                                   last_seen_at = ?
+                                               WHERE id = ?""",
+                                            (importance, now_ts, target)
+                                        )
                                         decision_made = True
                                         print(f"    UPDATE: {key[:60]}... ({reason[:80]})")
-                                elif decision == "contradict":
-                                    # Contradiction — invalidate old, add new
-                                    if target and graph.has_node(target):
-                                        graph.nodes[target]["superseded_by"] = node_id
-                                        graph.nodes[target]["valid_to"] = now
+                                    elif decision == "contradict":
+                                        db.invalidate_fact(target, superseded_by=None)  # New ID not yet available
                                         print(f"    CONTRADICT: {key[:60]}... ({reason[:80]})")
-                    except Exception as e:
-                        print(f"    ⚠ Decision engine error: {e}")
-                        decision_made = False
-                
-                if decision_made:
-                    continue  # Decision handled — skip normal add
-                
-                graph.add_node(
-                    node_id,
-                    content=key,
-                    type="fact",
-                    category=category,
-                    session_id=session_id,
-                    importance=importance,
-                    seen_count=1,
-                    created_at=now,
-                    last_seen_at=now,
-                    embedding=embedding,
-                )
-                nodes_added += 1
-                new_node_ids.append(node_id)
-                target_node_id = node_id
+                except Exception as e:
+                    print(f"    ⚠ Decision engine error: {e}")
 
-                # حدّث المصفوفة المُسرَّعة لكي يُكشَف التكرار داخل هذه الدفعة نفسها
-                q_normalized = np.asarray(embedding, dtype=np.float32)
-                q_normalized = q_normalized / max(np.linalg.norm(q_normalized), 1e-10)
-                if existing_fact_matrix is None:
-                    existing_fact_matrix = q_normalized.reshape(1, -1)
-                else:
-                    existing_fact_matrix = np.vstack([
-                        existing_fact_matrix,
-                        q_normalized.reshape(1, -1),
-                    ])
-                existing_fact_nodes.append(node_id)
+            if decision_made:
+                continue  # Decision handled — skip normal add
 
-                # Edge to category (لـ nodes جديدة فقط)
-                cat_id = f"category_{category}"
-                if not graph.has_node(cat_id):
-                    graph.add_node(
-                        cat_id,
-                        content=f"Category: {category}",
-                        type="category",
-                        category=category,
-                        created_at=now,
-                        embedding=None,  # P2: no embedding for category nodes (not searchable)
-                    )
-                if not graph.has_edge(node_id, cat_id):
-                    graph.add_edge(node_id, cat_id, weight=0.9, type="belongs_to")
-                    edges_added += 1
+            # إدراج الحقيقة الجديدة
+            fact_id = db.upsert_fact(
+                key=key,
+                category=category,
+                embedding=embedding,
+                session_id=session_id,
+                source='graph_updater',
+                importance=importance,
+            )
+            nodes_added += 1
+            new_fact_ids.append(fact_id)
 
-        # Edge to session — يُضاف للنود الهدف (جديد أو مدموج)
-        if session_id:
-            session_node = f"session_{_node_id(session_id)}"
-            if not graph.has_node(session_node):
-                graph.add_node(
-                    session_node,
-                    content=f"Session: {session_id[:16]}",
-                    type="session",
-                    session_id=session_id,
-                    created_at=now,
-                    embedding=None,  # P2: no embedding for session nodes (not searchable)
-                )
-            if not graph.has_edge(target_node_id, session_node):
-                graph.add_edge(target_node_id, session_node, weight=0.7, type="from_session")
-                edges_added += 1
+            # أضف للتضمينات اللحظية (لكشف التكرار داخل الدفعة نفسها)
+            q_normalized = np.asarray(embedding, dtype=np.float32)
+            q_normalized = q_normalized / max(np.linalg.norm(q_normalized), 1e-10)
+            if existing_matrix is None:
+                existing_matrix = q_normalized.reshape(1, -1)
+            else:
+                existing_matrix = np.vstack([existing_matrix, q_normalized.reshape(1, -1)])
+            existing_ids.append(fact_id)
 
     # ====================================================
     # روابط التشابه بين النودات الجديدة والموجودة (للاسترجاع لاحقاً)
-    # ملاحظة: عتبة 0.7 هنا للروابط فقط — أي pair فوق DEDUP_THRESHOLD
-    # تم دمجها أصلاً في اللوب أعلاه ولن تصل إلى هنا.
     # ====================================================
-    if new_node_ids:
+    if new_fact_ids:
         new_embs = []
-        for nid in new_node_ids:
-            emb = graph.nodes[nid].get("embedding", [])
-            if len(emb) == EMBEDDING_DIM:
-                new_embs.append((nid, emb))
+        for nid in new_fact_ids:
+            row = conn.execute("SELECT embedding FROM facts WHERE id = ?", (nid,)).fetchone()
+            if row and row[0]:
+                from db import unpack_embedding
+                new_embs.append((nid, unpack_embedding(row[0])))
 
         existing_facts = []
-        for n, d in graph.nodes(data=True):
-            if d.get("type") == "fact" and n not in set(new_node_ids):
-                emb = d.get("embedding", [])
-                if len(emb) == EMBEDDING_DIM:
-                    existing_facts.append((n, emb))
+        for nid in existing_ids:
+            if nid not in new_fact_ids:
+                row = conn.execute("SELECT embedding FROM facts WHERE id = ?", (nid,)).fetchone()
+                if row and row[0]:
+                    from db import unpack_embedding
+                    existing_facts.append((nid, unpack_embedding(row[0])))
 
         if new_embs and existing_facts:
             new_arr = np.array([e for _, e in new_embs])
@@ -556,13 +406,9 @@ def add_facts_to_graph(graph, facts):
 
             for i in range(len(new_embs)):
                 for j in range(len(existing_facts)):
-                    # النطاق: 0.7 ≤ sim < SEMANTIC_DEDUP_THRESHOLD
-                    # (أعلى من ذلك تم دمجه، أقل لا يستحق رابطاً)
                     if 0.7 < sim[i][j] < SEMANTIC_DEDUP_THRESHOLD:
-                        ni, nj = new_embs[i][0], existing_facts[j][0]
-                        if not graph.has_edge(ni, nj):
-                            graph.add_edge(ni, nj, weight=float(sim[i][j]), type="similar")
-                            edges_added += 1
+                        db.add_relation(new_embs[i][0], existing_facts[j][0], "similar", float(sim[i][j]))
+                        relations_added += 1
 
         # new vs new
         if len(new_embs) > 1:
@@ -572,12 +418,12 @@ def add_facts_to_graph(graph, facts):
             for i in range(len(new_embs)):
                 for j in range(i + 1, len(new_embs)):
                     if 0.7 < sim[i][j] < SEMANTIC_DEDUP_THRESHOLD:
-                        ni, nj = new_embs[i][0], new_embs[j][0]
-                        if not graph.has_edge(ni, nj):
-                            graph.add_edge(ni, nj, weight=float(sim[i][j]), type="similar")
-                            edges_added += 1
+                        db.add_relation(new_embs[i][0], new_embs[j][0], "similar", float(sim[i][j]))
+                        relations_added += 1
 
-    return nodes_added, edges_added, nodes_merged
+    conn.commit()
+    return nodes_added, relations_added, nodes_merged
+
 
 # ============================================================
 # Main
@@ -585,9 +431,12 @@ def add_facts_to_graph(graph, facts):
 
 def main():
     print("=" * 60)
-    print(f"Hermes Memory Graph Updater (BGE-M3 — same as unified)")
+    print(f"Hermes Memory Graph Updater (SQLite + BGE-M3)")
     print("=" * 60)
 
+    # Init DB
+    db = get_db(DB_PATH)
+    
     # Load BGE-M3
     print("  Loading BGE-M3 embedding model...")
     start_load = time.time()
@@ -598,38 +447,36 @@ def main():
         print(f"  ERROR: Failed to load BGE-M3: {e}")
         return
 
-    graph = load_or_create_graph()
-    print(f"  Existing graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
+    # Stats before
+    s_before = db.stats()
+    print(f"  Existing facts: {s_before['live_facts']} live, {s_before['relations']} relations")
 
-    # Read new facts FIRST (before orphan cleanup, so dedup has full graph)
-    result = read_new_facts()
-    new_facts, indexed_hashes = result
+    # Read new facts FIRST (before orphan cleanup, so dedup has full DB)
+    new_facts, indexed_hashes = read_new_facts(db)
 
     if not new_facts:
         print("  No new facts to add.")
         # Still run orphan cleanup even if no new facts
-        orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
+        orphan_count, orphan_hashes = remove_orphan_nodes(db)
         if orphan_hashes:
-            tracker = load_graph_tracker()
-            current = set(tracker.get("indexed_fact_hashes", []))
-            current -= orphan_hashes
-            tracker["indexed_fact_hashes"] = list(current)
-            save_graph_tracker(tracker)
-        # Persist orphan removal to disk
-        if orphan_facts or orphan_others:
-            save_graph(graph)
+            current = indexed_hashes - orphan_hashes
+            db.set_state('tracker_hashes', json.dumps(list(current)))
+            db.set_state('tracker_count', str(len(current)))
+        if orphan_count:
+            print(f"  Orphans cleaned: {orphan_count} facts")
+        db.log_event("run_complete", "No new facts")
         return
 
     print(f"  New facts found: {len(new_facts)}")
 
     start = time.time()
-    nodes_added, edges_added, nodes_merged = add_facts_to_graph(graph, new_facts)
+    nodes_added, edges_added, nodes_merged = add_facts_to_db(db, new_facts)
     elapsed = time.time() - start
 
     print(f"  Nodes added: {nodes_added}")
     print(f"  Nodes merged (semantic dedup): {nodes_merged}")
-    print(f"  Edges added: {edges_added}")
-    print(f"  Embedding time: {elapsed:.1f}s")
+    print(f"  Relations added: {edges_added}")
+    print(f"  Processing time: {elapsed:.1f}s")
 
     # Register hashes in tracker ONLY AFTER successful add
     new_hashes = set()
@@ -639,19 +486,28 @@ def main():
             new_hashes.add(hashlib.md5(key.encode()).hexdigest())
     indexed_hashes.update(new_hashes)
 
-    # Orphan cleanup AFTER adding — dedup had full graph
-    orphan_facts, orphan_others, orphan_hashes = remove_orphan_nodes(graph)
+    # Orphan cleanup AFTER adding — dedup had full DB
+    orphan_count, orphan_hashes = remove_orphan_nodes(db)
     if orphan_hashes:
         indexed_hashes -= orphan_hashes
 
-    # Persist both new facts AND orphan removal
-    save_graph(graph)
-    tracker = load_graph_tracker()
-    tracker["indexed_fact_hashes"] = list(indexed_hashes)
-    save_graph_tracker(tracker)
+    # Persist tracker state to SQLite
+    db.set_state('tracker_hashes', json.dumps(list(indexed_hashes)))
+    db.set_state('tracker_count', str(len(indexed_hashes)))
+    db.set_state('last_run', datetime.now(timezone.utc).isoformat())
 
-    print(f"\n✓ Graph updated: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
-    print(f"  → This graph is now searchable via prefetch() automatically!")
+    # Final stats
+    s_after = db.stats()
+    print(f"\n✓ Graph updated: {s_after['live_facts']} facts, {s_after['relations']} relations")
+    print(f"  → Searchable via unified_search() and db.search_similar()")
+    db.log_event("run_complete", f"Added {nodes_added} facts, {edges_added} relations")
+
+    # Vacuum periodically (every 10 runs)
+    run_count = int(db.get_state('run_count') or '0') + 1
+    db.set_state('run_count', str(run_count))
+    if run_count % 10 == 0:
+        db.vacuum()
+
 
 if __name__ == "__main__":
     main()

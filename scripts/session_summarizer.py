@@ -337,6 +337,8 @@ def generate_summary(session_id, messages):
 # ============================================================
 
 def save_summary(session_id, summary_data):
+    """Save summary to disk (JSONL + SQLite dual-write)."""
+    import fcntl
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
     os.makedirs(FACTS_DIR, exist_ok=True)
 
@@ -352,16 +354,16 @@ def save_summary(session_id, summary_data):
     facts = summary_data.get("facts", [])
     if not isinstance(facts, list):
         facts = []
+
+    # Phase 1: Write facts to JSONL (existing behavior — source of truth)
     saved_count = 0
     for fact in facts:
         if not isinstance(fact, dict):
             continue
-        # P0-5: Use unified quality gate (replaces duplicate SKIP_PHRASES + length checks)
         key = (fact.get("key") or "").strip()
         if not key or len(key) < MIN_FACT_KEY_LENGTH:
             continue
 
-        # P0-1: Use unified quality gate (Arabic-aware + single skip phrases)
         if is_junk_fact(key):
             continue
 
@@ -379,7 +381,6 @@ def save_summary(session_id, summary_data):
             "source": "session_summarizer",
         }
 
-        # File locking to prevent race conditions with graph_updater
         with open(fact_file, "a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
@@ -388,7 +389,44 @@ def save_summary(session_id, summary_data):
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         saved_count += 1
 
-    print(f"  Facts saved: {saved_count}")
+    # Phase 2: Dual-Write to SQLite (non-blocking, best-effort)
+    # JSONL remains source of truth; SQLite failures are logged but don't abort
+    db_count = 0
+    try:
+        _script_dir = str(pathlib.Path(__file__).parent)
+        if _script_dir not in sys.path:
+            sys.path.insert(0, _script_dir)
+        from db import get_db
+        db = get_db()
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            key = (fact.get("key") or "").strip()
+            if not key or len(key) < MIN_FACT_KEY_LENGTH:
+                continue
+            if is_junk_fact(key):
+                continue
+            category = fact.get("category", "general")
+            if category not in VALID_CATEGORIES:
+                category = "general"
+            try:
+                db.upsert_fact(
+                    key=key,
+                    category=category,
+                    embedding=None,  # graph_updater adds embeddings later
+                    session_id=session_id,
+                    source='session_summarizer',
+                    importance=summary_data.get("importance", 1),
+                )
+                db_count += 1
+            except Exception as e:
+                pass  # Silent — SQLite is secondary, JSONL is truth
+        if db_count > 0:
+            print(f"  SQLite dual-write: {db_count} facts indexed")
+    except Exception as e:
+        print(f"  ⚠ SQLite dual-write unavailable: {e}")
+
+    print(f"  Facts saved: {saved_count} (JSONL) + {db_count} (SQLite)")
     return saved_count
 
 # ============================================================

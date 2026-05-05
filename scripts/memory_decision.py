@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Hermes Memory Decision Engine — Mem0-style ADD/UPDATE/DELETE/NOOP resolver.
+Hermes Memory Decision Engine — SQLite Edition (P2)
+
+Mem0-style ADD/UPDATE/DELETE/NOOP resolver.
+Reads from SQLite facts table instead of NetworkX graph.json.
 
 P2: For each candidate fact, retrieve top-k similar existing facts,
 then a short LLM call decides: ADD (new), UPDATE (refinement),
 DELETE+ADD (contradiction), or NOOP (already known).
-
-This converts the append-only fact log into a self-cleaning knowledge base.
 """
 
 import json
@@ -16,6 +17,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from datetime import datetime, timezone
 
 # ============================================================
@@ -23,6 +25,7 @@ from datetime import datetime, timezone
 # ============================================================
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:7b")
+DB_PATH = os.path.expanduser("~/.hermes/memory/hermes_memory.db")
 
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
@@ -32,9 +35,9 @@ VALID_CATEGORIES = (
 # ============================================================
 # Arabic normalization (import from quality_gates if available)
 # ============================================================
-_qg_dir = os.path.dirname(os.path.abspath(__file__))
-if _qg_dir not in sys.path:
-    sys.path.insert(0, _qg_dir)
+_script_dir = str(Path(__file__).parent)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 try:
     from quality_gates import normalize_arabic_text
@@ -66,7 +69,6 @@ def _get_embedding_model():
         from unified.embedding_model import EmbeddingModel
         _embedding_model = EmbeddingModel(model_name="BAAI/bge-m3", device="cpu", use_fp16=False)
     except ImportError:
-        # Fallback: use sentence-transformers directly
         from sentence_transformers import SentenceTransformer
         _embedding_model = SentenceTransformer("BAAI/bge-m3", device="cpu")
     
@@ -74,76 +76,60 @@ def _get_embedding_model():
 
 
 def embed(text):
+    """Get BGE-M3 embedding."""
     model = _get_embedding_model()
     if hasattr(model, 'embed_query'):
         return model.embed_query(text)
     return model.encode([text], normalize_embeddings=True)[0].tolist()
 
 # ============================================================
-# Graph loading
+# DB access (SQLite, NOT NetworkX)
 # ============================================================
-GRAPHS_DIR = os.path.expanduser("~/.hermes/graphs/hermes-memory")
+_db = None
 
-def load_graph():
-    """Load the existing graph as (node_ids, embeddings, contents)."""
-    graph_path = os.path.join(GRAPHS_DIR, "graph.json")
-    if not os.path.exists(graph_path):
-        return [], [], []
-    
-    import networkx as nx
-    G = nx.readwrite.json_graph.node_link_graph(json.load(open(graph_path)))
-    
-    node_ids = []
-    embeddings = []
-    contents = []
-    
-    for nid in G.nodes():
-        nd = G.nodes[nid]
-        if nd.get("type") != "fact":
-            continue
-        emb = nd.get("embedding")
-        content = nd.get("content", "")
-        if emb and len(emb) > 0 and content:
-            node_ids.append(nid)
-            embeddings.append(emb)
-            contents.append(content)
-    
-    return node_ids, embeddings, contents
+def _get_db():
+    """Lazy-load MemoryDB singleton."""
+    global _db
+    if _db is None:
+        from db import MemoryDB
+        _db = MemoryDB(DB_PATH)
+        _db.init()
+    return _db
 
 # ============================================================
-# Decision logic
+# Find similar facts (SQLite-based)
 # ============================================================
 
-def find_similar_facts(candidate_text, node_ids, embeddings, contents, top_k=3):
-    """Find top-k similar existing facts via cosine similarity."""
-    if not embeddings:
-        return []
-    
+def find_similar_facts(candidate_text: str, top_k: int = 3) -> list:
+    """
+    Find top-k similar existing facts via cosine similarity.
+    Reads from SQLite facts table (live facts with embeddings).
+    """
     import numpy as np
     
-    cand_emb = embed(normalize_arabic_text(candidate_text))
-    cand_vec = np.asarray(cand_emb, dtype=np.float32)
-    cand_vec = cand_vec / max(np.linalg.norm(cand_vec), 1e-10)
+    db = _get_db()
     
-    emb_matrix = np.asarray(embeddings, dtype=np.float32)
-    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-    emb_matrix = emb_matrix / np.maximum(norms, 1e-10)
+    # Normalize candidate
+    normalized_text = normalize_arabic_text(candidate_text)
+    cand_emb = embed(normalized_text)
     
-    sims = emb_matrix @ cand_vec
-    top_indices = np.argsort(-sims)[:top_k]
+    # Use db.search_similar for efficient vector search
+    results = db.search_similar(cand_emb, top_k=top_k, threshold=0.5)
     
-    results = []
-    for idx in top_indices:
-        if sims[idx] < 0.5:
-            break
-        results.append({
-            'node_id': node_ids[idx],
-            'content': contents[idx],
-            'similarity': float(sims[idx]),
-        })
-    
-    return results
+    # Format to match old API
+    return [
+        {
+            'node_id': r['id'],
+            'content': r['key'],
+            'similarity': r['similarity'],
+        }
+        for r in results
+    ]
 
+
+# ============================================================
+# LLM Call
+# ============================================================
 
 def _call_ollama(prompt, timeout=30):
     """Call Ollama API for decision."""
@@ -168,10 +154,20 @@ def _call_ollama(prompt, timeout=30):
         return None
 
 
+# ============================================================
+# Decision logic
+# ============================================================
+
 def decide(candidate_fact, similar_facts):
     """Decide: ADD / UPDATE / DELETE+ADD / NOOP.
     
+    Args:
+        candidate_fact: dict with 'key', 'category', etc.
+        similar_facts: list of {'node_id': int, 'content': str, 'similarity': float}
+    
     Returns: (decision, target_node_id_or_none, reason)
+        decision ∈ {'add', 'update', 'contradict', 'noop'}
+        target_node_id: SQLite fact id (int) or None
     """
     if not similar_facts:
         return ("add", None, "No similar facts found — new knowledge")
@@ -255,3 +251,96 @@ Respond with JSON only: {{"decision": "...", "target_node_id": "..." or null, "r
         decision = "noop"
     
     return (decision, target, reason)
+
+
+# ============================================================
+# High-level API: process a candidate fact end-to-end
+# ============================================================
+
+def process_fact(candidate_fact: dict) -> dict:
+    """
+    Process a single candidate fact through the decision engine.
+    
+    Args:
+        candidate_fact: {'key': str, 'category': str, 'importance': int, ...}
+    
+    Returns:
+        {'decision': str, 'action': str, 'fact_id': int|None, 'reason': str}
+    """
+    similar = find_similar_facts(candidate_fact['key'], top_k=3)
+    decision, target_id, reason = decide(candidate_fact, similar)
+    
+    result = {
+        'decision': decision,
+        'target_id': target_id,
+        'reason': reason,
+        'similar_count': len(similar),
+    }
+    
+    # Execute the decision on the database
+    if decision == 'add':
+        db = _get_db()
+        try:
+            fact_id = db.upsert_fact(
+                key=candidate_fact['key'],
+                category=candidate_fact.get('category', 'general'),
+                embedding=None,  # No embedding yet — will be added by graph_updater
+                session_id=candidate_fact.get('session_id', ''),
+                source='decision_engine',
+                importance=candidate_fact.get('importance', 1),
+            )
+            result['fact_id'] = fact_id
+            result['action'] = 'INSERTED'
+        except Exception as e:
+            result['action'] = f'ERROR: {e}'
+    
+    elif decision == 'noop':
+        result['fact_id'] = target_id
+        result['action'] = 'SKIPPED (already exists)'
+    
+    elif decision == 'update':
+        result['fact_id'] = target_id
+        result['action'] = 'UPDATED existing'
+    
+    elif decision == 'contradict':
+        if target_id:
+            db = _get_db()
+            db.invalidate_fact(target_id)
+        result['fact_id'] = target_id
+        result['action'] = 'INVALIDATED old (contradiction)'
+    
+    return result
+
+
+# ============================================================
+# CLI — for testing
+# ============================================================
+if __name__ == "__main__":
+    import sys
+    
+    # Test with a sample fact
+    test_fact = {
+        'key': 'المستخدم يفضل لغة بايثون في مشاريع الذكاء الاصطناعي',
+        'category': 'preference',
+        'importance': 3,
+        'session_id': 'test_001',
+    }
+    
+    print("=" * 60)
+    print("Memory Decision Engine — SQLite Edition")
+    print("=" * 60)
+    
+    db = _get_db()
+    s = db.stats()
+    print(f"  DB: {s['live_facts']} live facts")
+    
+    print(f"\n  Testing fact: {test_fact['key'][:60]}")
+    similar = find_similar_facts(test_fact['key'], top_k=3)
+    print(f"  Similar facts found: {len(similar)}")
+    for sf in similar:
+        print(f"    - sim={sf['similarity']:.3f}: {sf['content'][:60]}")
+    
+    decision, target, reason = decide(test_fact, similar)
+    print(f"\n  Decision: {decision.upper()}")
+    print(f"  Target: {target}")
+    print(f"  Reason: {reason}")
