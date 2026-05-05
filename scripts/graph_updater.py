@@ -213,9 +213,12 @@ def remove_orphan_nodes(db: MemoryDB):
         db.invalidate_fact(fact_id)
 
     # Clean up orphan relations
+    # NOTE: Dynamic placeholder count is safe — orphan_ids are DB-internal integers,
+    # not user-controlled input. All values passed via parameterized query.
     if orphan_ids:
+        placeholders = ','.join('?' * len(orphan_ids))
         conn.execute(
-            f"DELETE FROM fact_relations WHERE from_id IN ({','.join('?'*len(orphan_ids))}) OR to_id IN ({','.join('?'*len(orphan_ids))})",
+            f"DELETE FROM fact_relations WHERE from_id IN ({placeholders}) OR to_id IN ({placeholders})",
             orphan_ids + orphan_ids
         )
         conn.commit()
