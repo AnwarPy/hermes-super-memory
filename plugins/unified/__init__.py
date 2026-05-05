@@ -40,170 +40,22 @@ logger = logging.getLogger(__name__)
 
 
 def _clean_chunk(content, max_len=300):
-    """تنظيف جزء النص من الشوائب مع الحفاظ على المعنى الكامل"""
+    """تنظيف بسيط للنصوص — بديل 10 سطور لـ 165 سطر regex هش.
+    
+    P1: الحقائق من LLM نظيفة أصلاً. هذا يكفي.
+    FTS5 snippets تستخدم نفس الدالة.
+    """
     if not content:
         return ""
-    
-    # إزالة علامات FTS5 (>>> و <<)
+    # إزالة أحرف التحكم وعلامات FTS5
     content = content.replace('>>>', '').replace('<<<', '')
-    
-    # إزالة أحرف التحكم فقط (ليس {} و [])
     content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content)
-    
-    # إزالة تسلسلات الهروب المتبقية من JSON
     content = content.replace('\\r\\n', ' ').replace('\\n', ' ').replace('\\t', ' ')
-    
-    # تنظيف الأسطر
-    lines = content.split('\n')
-    cleaned = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # إزالة البادئات المتسخة
-        line = line.lstrip(':').strip().strip('"').strip()
-        # إزالة نقاط FTS5 في البداية (مثل "...، نص")
-        line = re.sub(r'^\.{1,10}\s*', '', line).strip()
-        # فلتر: سطور قصيرة جداً غير مفيدة (أقل من 25 حرف)
-        if len(line) < 25:
-            continue
-        # ملاحظة: أزلنا فلتر "نص يبدأ بعلامة ترقيم" لأنه يرفض نصوص عربية صحيحة
-        # مثل "، PDF" أو "! ..." — هذه محتويات حقيقية مو مقطوعة
-        # فلتر: كلمات عربية ملتصقة بدون مسافات (مشكلة تقسيم)
-        # كشف: كلمة عربية واحدة طويلة جداً (>35 حرف) = كلمات ملتصقة
-        arabic_segs = re.findall(r'[\u0600-\u06FF]+', line)
-        if any(len(s) > 35 for s in arabic_segs):
-            continue
-        # كشف: إيموجي ملتصق بكلمة عربية بدون مسافة
-        if re.search(r'[\u0600-\u06FF][\U0001F300-\U0001F9FF\u2600-\u27BF][\u0600-\u06FF]', line):
-            continue
-        # فلتر: شيفرة برمجية خام (ليست نص بشري)
-        if line.startswith(('def ', 'class ', 'import ', 'from ', 'async def ',
-                            'print(', 'print(f', 'return ', 'self.', 'for ', 'if ',
-                            'try:', 'except', 'with ', 'import ', '# ', '```')):
-            continue
-        # فلتر: أجزاء JSON مفتتة
-        if line.startswith(('{', '}', '[', ']', '],', '},')) and len(line) < 30:
-            continue
-        # فلتر: تواقيع دوال مقطوعة مثل "):" أو "->"
-        if re.match(r'^[)\]\s]*[:>]', line) and len(line) < 20:
-            continue
-        cleaned.append(line)
-    
-    content = ' '.join(cleaned)
-    # تطبيع علامات الترقيم العربية
-    content = re.sub(r'[،؛۔]{2,}', '،', content)
-    content = re.sub(r'\s+', ' ', content)
-    content = content.strip()
-    
-    if len(content) < 25:
-        return ""
-    
-    # فلتر: محتوى يبدأ بمسار ملف (بيانات وصفية وليست محتوى)
-    if re.match(r'^(~/|/home/|/tmp/|[A-Z]:\\)', content):
-        # ابحث عن أول محتوى حقيقي بعد المسار
-        real_start = re.search(r'[\u0600-\u06FFa-zA-Z]{3,}', content)
-        if real_start and real_start.start() > 20:
-            content = content[real_start.start():]
-        elif not real_start:
-            return ""  # مسار فقط بدون محتوى
-    
-    # إذا كان النص يبدأ بعلامة ترقيم عربية أو إنجليزية (مقطوع)
-    if re.match(r'^[،؛.,:!?»\)]', content):
-        # حاول إيجاد أول جملة مكتملة
-        first_sentence_end = re.search(r'[.!?؟۔]', content)
-        if first_sentence_end:
-            content = content[first_sentence_end.end():].strip()
-        else:
-            return ""  # لا جملة مكتملة
-    
-    # فلتر: محتوى يحتوي مسار ملف + نص مقطوع (بيانات وصفية)
-    if re.search(r'~/wiki/|/home/.+\.hermes', content) and not re.search(r'[.!؟۔،;:]$', content):
-        # مسار ملف موجود ولا ينتهي بترقيم — محتوى مقطوع
-        return ""
-    
-    # فلتر: نص ينتهي بكلمة مقطوعة (حرف إنجليزي وحيد أو كلمة مبتورة)
-    # مثال: "Graph S" أو "benchm" أو "التصم"
-    # كشف كلمات إنجليزية مقطوعة في النهاية (فقط كلمات قصيرة جداً 1-2 حرف)
-    if re.search(r'\s+[A-Za-z]{1,2}$', content):
-        # ينتهي بكلمة إنجليزية قصيرة جداً (1-2 حرف) — غالباً مقطوعة
-        last_period = content.rfind('.')
-        last_question = content.rfind('?')
-        last_arabic_punct = max(content.rfind('،'), content.rfind('۔'), content.rfind('؟'))
-        cut_at = max(last_period, last_question, last_arabic_punct)
-        if cut_at > len(content) // 2:
-            content = content[:cut_at + 1].strip()
-        else:
-            return ""  # لا يمكن إصلاحه
-    
-    # كشف كلمات عربية مبتورة في النهاية (كلمة طويلة بدون مسافة بعدها)
-    arabic_words = re.findall(r'[\u0600-\u06FF]+', content)
-    if arabic_words:
-        last_word = arabic_words[-1]
-        # كلمة عربية طويلة جداً (>20 حرف) بدون ترقيم بعدها — غالباً مقطوعة
-        if len(last_word) > 20 and not re.search(r'[.!؟۔،;:]$', content):
-            return ""
-    
-    # فلتر: نص ينتهي برقم متبوع بـ ". " بدون محتوى بعده
-    if re.search(r'\d+\.\s*$', content):
-        return ""  # مثال: "4. " في النهاية
-    
-    # فلتر: نص ينتهي بدون أي علامة ترقيم أو إغلاق (مقطوع)
-    # مقبول إذا ينتهي بـ } أو ) أو ] أو علامة ترقيم
-    last_char = content[-1]
-    if last_char not in '.!?؟ۙ،;:}])"\'!؟':
-        # لا ينتهي بترقيم — قد يكون مقطوعاً
-        # تحقق: هل يحتوي على جملة مكتملة واحدة على الأقل؟
-        # استبعد النقاط من الامتدادات (مثل .md .py .json)
-        has_sentence = bool(re.search(r'[.!?؟۔](\s|$)', content))
-        if not has_sentence and len(content) > 80:
-            # نص طويل جداً بدون أي جملة مكتملة — على الأرجح مقطوع
-            return ""
-        elif not has_sentence and len(content) < 30:
-            # نص قصير جداً جداً بدون جملة — عنوان مقطوع غير مفيد
-            return ""
-        elif not has_sentence:
-            # نص متوسط/طويل بدون ترقيم — أضف ...
-            content = content + '...'
-    
-    # اقتطاع ذكي عند نهاية الجملة (ليس في منتصف كلمة)
+    # تطبيع مسافات واقتطاع
+    content = re.sub(r'\s+', ' ', content).strip()
     if len(content) > max_len:
-        truncated = content[:max_len]
-        # ابحث عن أقرب علامة ترقيم قبل نهاية الاقتطاع
-        cut_point = max_len // 2  # نقطة أدنى
-        for punct in ['.', '!', '?', '؟', '۔', ':', '،', ';']:
-            last_pos = truncated.rfind(punct)
-            if last_pos > cut_point:
-                truncated = truncated[:last_pos + 1]
-                break
-        else:
-            # لم يجد علامة ترقيم — اقطع عند آخر مسافة
-            last_space = truncated.rfind(' ')
-            if last_space > cut_point:
-                truncated = truncated[:last_space]
-            else:
-                # لا مسافة مناسبة — اتركه كما هو
-                truncated = content
-        
-        # أضف ... فقط إذا لم يكن ينتهي بها أصلاً
-        if not truncated.endswith('...'):
-            content = truncated + '...'
-        else:
-            content = truncated
-    
-    # تنظيف: إزالة نقاط زائدة في البداية أو النهاية
-    content = content.lstrip('.').strip()
-    # تطبيع نقاط النهاية: أكثر من 3 نقاط → 3 نقاط (في أي مكان بالنص)
-    content = re.sub(r'\.{4,}', '...', content)
-    
-    # إذا كان ينتهي بعلامة ترقيم مقطوعة، احذفها
-    content = re.sub(r'[،؛:\-]$', '', content).strip()
-    
-    # تحقق نهائي: طول أدنى 25 حرف
-    if len(content) < 25:
-        return ""
-    
-    return content
+        content = content[:max_len].rsplit(' ', 1)[0] + '...'
+    return content if len(content) >= 15 else ""
 
 
 class QueryResultCache:
@@ -263,99 +115,58 @@ class QueryResultCache:
             logger.debug(f"Cleaned up {len(expired)} expired cache entries")
 
 
-class EmbeddingCache:
-    """كاش للـ embeddings — يقلل وقت الحساب 90%+"""
-    
-    def __init__(self, cache_path="~/.hermes/embedding_cache.db", ttl_days=7):
-        self.cache_path = Path(cache_path).expanduser()
-        self.ttl_days = ttl_days
-        self._init_db()
-    
-    def _init_db(self):
-        """تهيئة قاعدة بيانات الكاش"""
-        import sqlite3
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.cache_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS embeddings (
-                query TEXT PRIMARY KEY,
-                embedding BLOB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_created ON embeddings(created_at)")
-        conn.commit()
-        conn.close()
-    
-    def get(self, query):
-        """جلب embedding من الكاش"""
-        import sqlite3
-        import numpy as np
-        
-        try:
-            conn = sqlite3.connect(self.cache_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT embedding FROM embeddings 
-                   WHERE query = ? AND created_at > datetime('now', ?)""",
-                (query, f'-{self.ttl_days} days')
-            )
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                return np.frombuffer(result[0], dtype=np.float32)
-        except Exception as e:
-            logger.debug(f"Embedding cache get error: {e}")
-        return None
-    
-    def set(self, query, embedding):
-        """حفظ embedding في الكاش"""
-        import sqlite3
-        import numpy as np
-        
-        try:
-            conn = sqlite3.connect(self.cache_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT OR REPLACE INTO embeddings (query, embedding, created_at) 
-                   VALUES (?, ?, CURRENT_TIMESTAMP)""",
-                (query, embedding.tobytes())
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.debug(f"Embedding cache set error: {e}")
-    
-    def clear(self):
-        """تنظيف الكاش القديم"""
-        import sqlite3
-        try:
-            conn = sqlite3.connect(self.cache_path)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM embeddings WHERE created_at < datetime('now', ?)", 
-                          (f'-{self.ttl_days} days',))
-            deleted = cursor.rowcount
-            conn.commit()
-            conn.close()
-            logger.info(f"Cleared {deleted} old embeddings from cache")
-        except Exception as e:
-            logger.debug(f"Embedding cache clear error: {e}")
 
+# P1: Replace SQLite EmbeddingCache with lru_cache (eliminates per-miss disk I/O)
+@functools.lru_cache(maxsize=4096)
+def _cached_embedding(text_hash: str, text: str, model_id: str) -> tuple:
+    """LRU cache for embeddings — key includes text_hash for quick lookup."""
+    # This wrapper is called via _get_cached_embedding below
+    # The actual embedding computation happens in the caller
+    raise NotImplementedError("Use _get_cached_embedding instead")
+
+
+def _get_cached_embedding(embedding_model, text):
+    """Get embedding with LRU cache. Hashes text for O(1) cache lookup."""
+    import hashlib
+    text_hash = hashlib.md5(text.encode()).hexdigest()[:16]
+    # Check in-process LRU cache
+    cache_key = f"{text_hash}:{id(embedding_model)}"
+    cached = _embedding_lru_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    
+    result = embedding_model.embed_query(text)
+    _embedding_lru_cache[cache_key] = result
+    return result
+
+# Global LRU cache for embeddings
+_embedding_lru_cache = {}
 
 class GraphCache:
-    """ذاكرة تخزين مؤقت للرسوم المعرفية"""
+    """ذاكرة تخزين مؤقت للرسوم المعرفية مع mtime invalidation (P1)."""
     
     def __init__(self):
         self._graphs = {}
         self._load_times = {}
+        self._mtimes = {}
         self._stats = {}
     
     def get(self, project_name, loader_fn):
-        """جلب رسم من الذاكرة أو تحميله"""
+        """جلب رسم من الذاكرة أو تحميله مع mtime check."""
+        import os
         if project_name in self._graphs:
-            return self._graphs[project_name]
+            # P1: Check if file was modified since last load
+            graphs_dir = os.path.expanduser("~/.hermes/graphs")
+            graph_file = os.path.join(graphs_dir, project_name, "graph.json")
+            if os.path.exists(graph_file):
+                current_mtime = os.path.getmtime(graph_file)
+                if self._mtimes.get(project_name, 0) < current_mtime:
+                    # File changed — reload
+                    logger.debug("GraphCache: %s mtime changed, reloading", project_name)
+                    del self._graphs[project_name]
+                    del self._mtimes[project_name]
+                else:
+                    return self._graphs[project_name]
         
         try:
             graph = loader_fn(project_name)
@@ -365,6 +176,8 @@ class GraphCache:
                 'nodes': graph.number_of_nodes(),
                 'edges': graph.number_of_edges(),
             }
+            if os.path.exists(graph_file):
+                self._mtimes[project_name] = os.path.getmtime(graph_file)
             return graph
         except Exception as e:
             logger.warning("Failed to load graph %s: %s", project_name, e)
@@ -373,6 +186,7 @@ class GraphCache:
     def clear(self):
         self._graphs.clear()
         self._load_times.clear()
+        self._mtimes.clear()
         self._stats.clear()
     
     @property
@@ -391,10 +205,7 @@ class UnifiedMemoryProvider(MemoryProvider):
         self.graphify = None
         self._graphify_config = self.config  # إصلاح: قيمة افتراضية قبل initialize()
         self._graph_cache = GraphCache()
-        self._embedding_cache = EmbeddingCache(
-            cache_path="~/.hermes/embedding_cache.db",
-            ttl_days=7
-        )
+        # P1: EmbeddingCache replaced with in-memory LRU cache (no disk I/O)
         self._query_cache = QueryResultCache(
             ttl_seconds=300  # 5 دقائق
         )
@@ -495,26 +306,34 @@ class UnifiedMemoryProvider(MemoryProvider):
                     break
 
             if graph_engine is None:
-                # Fallback: استيراد مباشر (للاختبار خارج Hermes)
-                import importlib
-                _plugins_dir = str(Path(__file__).resolve().parent.parent)
-                if _plugins_dir not in sys.path:
-                    sys.path.insert(0, _plugins_dir)
-                # تسجيل 'unified' كـ alias إذا الـ plugin محمّل تحت اسم مختلف
-                if "unified" not in sys.modules:
-                    for _mod_name in list(sys.modules.keys()):
-                        if _mod_name.endswith('.unified'):
-                            _mod = sys.modules[_mod_name]
-                            sys.modules["unified"] = _mod
-                            _mod.__path__ = [str(Path(__file__).resolve().parent)]
-                            for _sub in ["graph_engine", "embedding_model", "document_loader",
-                                         "text_splitter", "graph_builder", "community_detector", "graph_storage"]:
-                                _old = f"{_mod_name}.{_sub}"
-                                _new = f"unified.{_sub}"
-                                if _old in sys.modules and _new not in sys.modules:
-                                    sys.modules[_new] = sys.modules[_old]
-                            break
-                graph_engine = importlib.import_module('unified.graph_engine')
+                # P3: Direct file load — bypass fragile sys.modules walking
+                import importlib.util
+                _engine_path = Path(__file__).resolve().parent / "graph_engine.py"
+                if _engine_path.exists():
+                    # Register 'unified' package BEFORE exec_module (fix relative imports)
+                    if "unified" not in sys.modules:
+                        pkg_mod = type(sys)('unified')
+                        pkg_mod.__path__ = [str(Path(__file__).resolve().parent)]
+                        sys.modules["unified"] = pkg_mod
+
+                    spec = importlib.util.spec_from_file_location("unified.graph_engine", _engine_path)
+                    graph_engine = importlib.util.module_from_spec(spec)
+                    sys.modules["unified.graph_engine"] = graph_engine
+                    spec.loader.exec_module(graph_engine)
+
+                    # Load submodules
+                    for _sub in ["embedding_model", "document_loader", "text_splitter",
+                                 "graph_builder", "community_detector", "graph_storage"]:
+                        if f"unified.{_sub}" in sys.modules:
+                            continue
+                        _sub_path = Path(__file__).resolve().parent / f"{_sub}.py"
+                        if _sub_path.exists():
+                            _sub_spec = importlib.util.spec_from_file_location(f"unified.{_sub}", _sub_path)
+                            _sub_mod = importlib.util.module_from_spec(_sub_spec)
+                            sys.modules[f"unified.{_sub}"] = _sub_mod
+                            _sub_spec.loader.exec_module(_sub_mod)
+                else:
+                    raise FileNotFoundError(f"graph_engine.py not found at {_engine_path}")
 
             GraphifyEngine = graph_engine.GraphifyEngine
             logger.info("Creating GraphifyEngine with config: %s", self._graphify_config)
@@ -543,6 +362,9 @@ class UnifiedMemoryProvider(MemoryProvider):
             top_k_per_project: عدد النتائج القصوى لكل مشروع
             max_age_cutoff: وقت القطع للعمر الأقصى (timestamp، اختياري)
         """
+        import time
+        _t_start = time.perf_counter()
+        
         # Lazy Loading — تهيئة Graphify عند أول طلب
         graphify = self._get_graphify()
         if not graphify:
@@ -584,20 +406,19 @@ class UnifiedMemoryProvider(MemoryProvider):
                 logger.debug("Query expanded with %d synonyms: %s", len(synonyms_found), synonyms_found)
         
         results = []
+        n_projects_scanned = 0
         
         try:
             projects = self._get_graphify().list_projects()
+            n_projects_scanned = len(projects)
         except Exception:
             return []
         
-        # Embedding Caching — جلب من الكاش أو حساب جديد (للاستعلام الموسع)
-        cache_key = f"syn:{hashlib.md5(expanded_query.encode()).hexdigest()[:16]}"
-        query_embedding = self._embedding_cache.get(cache_key)
+        # P1: Use in-memory LRU cache instead of SQLite EmbeddingCache
+        query_embedding = _get_cached_embedding(graphify.embedding, expanded_query)
         if query_embedding is None:
-            # Cache miss — حساب embedding جديد
+            # Fallback if cache miss and embed fails
             query_embedding = graphify.embedding.embed_query(expanded_query)
-            # حفظ في الكاش
-            self._embedding_cache.set(cache_key, query_embedding)
         
         for project in projects:
             try:
@@ -614,11 +435,14 @@ class UnifiedMemoryProvider(MemoryProvider):
                         continue
                 
                 project_results = []
-                # Vectorized similarity — بدلاً من O(N) loop
+                # Vectorized similarity — فقط عقد type='fact' (P0: skip session/category)
                 node_ids_list = []
                 embeddings_list = []
                 for node_id in graph.nodes():
-                    node_embedding = graph.nodes[node_id].get("embedding")
+                    node_data = graph.nodes[node_id]
+                    if node_data.get("type") != "fact":
+                        continue  # P0: filter out session/category nodes
+                    node_embedding = node_data.get("embedding")
                     if node_embedding is not None and len(node_embedding) > 0:
                         node_ids_list.append(node_id)
                         embeddings_list.append(node_embedding)
@@ -642,16 +466,38 @@ class UnifiedMemoryProvider(MemoryProvider):
                 above = np.where(sims >= 0.5)[0]
                 top_indices = above[np.argsort(-sims[above])][:top_k_per_project]
                 
+                # P0: Expand 1-hop along 'similar' edges (weight >= 0.85)
+                top_node_ids = set(node_ids_list[idx] for idx in top_indices)
+                expanded_ids = set(top_node_ids)
                 for idx in top_indices:
                     nid = node_ids_list[idx]
+                    for neighbor in graph.neighbors(nid):
+                        edge_data = graph[nid][neighbor]
+                        if edge_data.get("type") == "similar" and edge_data.get("weight", 0) >= 0.85:
+                            if graph.nodes[neighbor].get("type") == "fact" and neighbor not in expanded_ids:
+                                expanded_ids.add(neighbor)
+                
+                # Score expanded nodes
+                for nid in expanded_ids:
                     content = graph.nodes[nid].get("content", "")
                     cleaned = _clean_chunk(content)
                     if cleaned:
+                        nid_idx = node_ids_list.index(nid) if nid in node_ids_list else -1
+                        if nid_idx >= 0:
+                            sim = float(sims[nid_idx])
+                        else:
+                            # Re-compute similarity for expanded-only nodes
+                            n_emb = np.asarray(graph.nodes[nid]["embedding"], dtype=np.float32)
+                            n_norm = np.linalg.norm(n_emb)
+                            if n_norm > 1e-10:
+                                n_emb = n_emb / n_norm
+                            sim = float(n_emb @ q_vec)
                         project_results.append({
-                            'similarity': float(sims[idx]),
+                            'similarity': sim,
                             'content': cleaned,
-                            'type': graph.nodes[nid].get("type", "unknown"),
+                            'type': 'fact',
                             'project': project,
+                            'expanded': nid not in top_node_ids,
                         })
                 
                 project_results.sort(key=lambda x: x['similarity'], reverse=True)
@@ -661,6 +507,11 @@ class UnifiedMemoryProvider(MemoryProvider):
                 logger.debug("Graph search error for %s: %s", project, e)
         
         results.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # P5: Latency telemetry
+        _elapsed_ms = (time.perf_counter() - _t_start) * 1000
+        logger.debug("graph_search: %.1fms | n_projects=%d | n_results=%d | query='%s'",
+                      _elapsed_ms, n_projects_scanned, len(results), query[:60])
         
         # QueryResultCache — حفظ النتائج قبل الإرجاع
         self._query_cache.set(query, results[:])

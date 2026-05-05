@@ -417,6 +417,56 @@ def add_facts_to_graph(graph, facts):
                 target_node_id = duplicate_of
                 nodes_merged += 1
             else:
+                # P2: Mem0-style decision loop (optional, controlled by env var)
+                # Only triggered when semantic dedup didn't catch it
+                decision_made = False
+                if os.getenv("MEM0_DECISION", "0") == "1":
+                    try:
+                        import importlib.util
+                        _md_path = Path(__file__).parent / "memory_decision.py"
+                        if _md_path.exists():
+                            spec = importlib.util.spec_from_file_location("memory_decision", _md_path)
+                            md = importlib.util.module_from_spec(spec)
+                            spec.loader.exec_module(md)
+                            
+                            node_ids, embeddings, contents = md.load_graph()
+                            similar = md.find_similar_facts(key, node_ids, embeddings, contents, top_k=3)
+                            if similar:
+                                decision, target, reason = md.decide(fact, similar)
+                                if decision == "noop":
+                                    # Already known — skip
+                                    target_node_id = target
+                                    nodes_merged += 1
+                                    decision_made = True
+                                    print(f"    NOOP: {key[:60]}... ({reason[:80]})")
+                                elif decision == "update":
+                                    # Refinement — merge into existing
+                                    if target and graph.has_node(target):
+                                        existing = graph.nodes[target]
+                                        existing["importance"] = max(existing.get("importance", 1), importance)
+                                        existing["seen_count"] = existing.get("seen_count", 1) + 1
+                                        existing["last_seen_at"] = now
+                                        aliases = existing.get("aliases", [])
+                                        if key not in aliases and key != existing.get("content"):
+                                            aliases.append(key)
+                                            existing["aliases"] = aliases[:10]
+                                        target_node_id = target
+                                        nodes_merged += 1
+                                        decision_made = True
+                                        print(f"    UPDATE: {key[:60]}... ({reason[:80]})")
+                                elif decision == "contradict":
+                                    # Contradiction — invalidate old, add new
+                                    if target and graph.has_node(target):
+                                        graph.nodes[target]["superseded_by"] = node_id
+                                        graph.nodes[target]["valid_to"] = now
+                                        print(f"    CONTRADICT: {key[:60]}... ({reason[:80]})")
+                    except Exception as e:
+                        print(f"    ⚠ Decision engine error: {e}")
+                        decision_made = False
+                
+                if decision_made:
+                    continue  # Decision handled — skip normal add
+                
                 graph.add_node(
                     node_id,
                     content=key,
