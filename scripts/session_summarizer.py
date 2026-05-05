@@ -34,23 +34,16 @@ MAX_MESSAGES_PER_SESSION = 100
 # Minimum fact key length to avoid useless single-word keys
 MIN_FACT_KEY_LENGTH = 15
 
-# ============================================================
-# Arabic normalization for reliable SKIP_PHRASES matching
-# ============================================================
-
-def normalize_arabic(text):
-    """Normalize Arabic text for reliable string matching.
-    Handles: diacritics (تَشكِيل), alef variants, ya/ta, extra spaces."""
-    # Remove diacritics
-    text = re.sub(r'[\u064B-\u065F\u0610-\u061A\u0670]', '', text)
-    # Unify alef
-    text = re.sub(r'[إأآٱ]', 'ا', text)
-    # Unify ya and ta marbuta
-    text = re.sub(r'ى', 'ي', text)
-    text = re.sub(r'ة', 'ه', text)
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+# P0: Import unified quality gates (single source of truth)
+import sys, pathlib
+_qg_path = pathlib.Path(__file__).parent
+if str(_qg_path) not in sys.path:
+    sys.path.insert(0, str(_qg_path))
+from quality_gates import (
+    normalize_arabic_text as normalize_arabic,
+    is_junk_fact,
+    is_arabic_heavy,
+)
 
 # الجلسة لا تُلخَّص قبل أن تكون "خاملة" (idle) لمدة >= هذه الدقائق منذ آخر رسالة.
 # الهدف: تجنّب تلخيص جلسات لا تزال مفتوحة وقد تُضاف لها رسائل جديدة.
@@ -363,20 +356,13 @@ def save_summary(session_id, summary_data):
     for fact in facts:
         if not isinstance(fact, dict):
             continue
-        # Quality gate: skip facts with empty or too-short keys
+        # P0-5: Use unified quality gate (replaces duplicate SKIP_PHRASES + length checks)
         key = (fact.get("key") or "").strip()
         if not key or len(key) < MIN_FACT_KEY_LENGTH:
             continue
 
-        # Quality gate: skip generic/useless phrases (with Arabic normalization)
-        skip_phrases = [
-            "help was provided", "assistant helped", "conversation was about",
-            "المحادثة كانت حول", "تم تقديم المساعدة", "تم التحقق من",
-            "system was built", "all dependencies", "instructions were sent",
-            "تم بناء النظام", "تم تثبيت جميع", "تم ارسال تعليمات",
-        ]
-        normalized_key = normalize_arabic(key.lower())
-        if any(normalize_arabic(phrase) in normalized_key for phrase in skip_phrases):
+        # P0-1: Use unified quality gate (Arabic-aware + single skip phrases)
+        if is_junk_fact(key):
             continue
 
         category = fact.get("category", "general")

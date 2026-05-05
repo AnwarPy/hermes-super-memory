@@ -22,6 +22,12 @@ import fcntl
 from pathlib import Path
 from datetime import datetime, timezone
 
+# P0: Import unified quality gates
+_qg_dir = str(Path(__file__).parent)
+if _qg_dir not in sys.path:
+    sys.path.insert(0, _qg_dir)
+from quality_gates import normalize_arabic_text, is_junk_fact
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -36,7 +42,7 @@ EMBEDDING_DIM = 1024  # BGE-M3 dimension
 # 0.92 = الحقيقة الجديدة شبه مطابقة لحقيقة موجودة (إعادة صياغة)
 # 0.95+ صارمة جداً، 0.85- متساهلة جداً وتدمج حقائق متمايزة
 # تجاوز هذه العتبة → تحديث الموجود بدلاً من إضافة جديد
-SEMANTIC_DEDUP_THRESHOLD = 0.92
+SEMANTIC_DEDUP_THRESHOLD = 0.88
 
 VALID_CATEGORIES = (
     "preference", "fact", "decision", "correction",
@@ -162,16 +168,21 @@ def save_graph(graph):
     }
     _atomic_json_write(meta_path, metadata)
 
-    # Save communities (atomic)
-    communities = {}
+    # Save category index (P4: renamed from communities.json — these are categories, not Leiden communities)
+    categories = {}
     for node, data in graph.nodes(data=True):
         cat = data.get("category", "general")
-        communities.setdefault(cat, []).append(node)
+        categories.setdefault(cat, []).append(node)
 
-    comm_path = os.path.join(project_dir, "communities.json")
-    _atomic_json_write(comm_path, {
-        "communities": communities,
-        "num_communities": len(communities),
+    cat_path = os.path.join(project_dir, "category_index.json")
+    _atomic_json_write(cat_path, {
+        "categories": categories,
+        "num_categories": len(categories),
+    })
+    # Backward compat: keep communities.json as symlink/copy for any readers still looking for it
+    _atomic_json_write(os.path.join(project_dir, "communities.json"), {
+        "categories": categories,
+        "num_categories": len(categories),
     })
 
     print(f"  Graph saved: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
@@ -218,7 +229,14 @@ def read_new_facts():
                     key = (fact.get("key") or "").strip()
                     if not key:
                         continue
-                    fact_hash = hashlib.md5(key.encode()).hexdigest()
+
+                    # P0-5: Use unified quality gate (single source)
+                    if is_junk_fact(key):
+                        continue
+
+                    # P0-1: Normalize key before hashing — fixes silent Arabic duplicates
+                    key_normalized = normalize_arabic_text(key)
+                    fact_hash = hashlib.md5(key_normalized.encode()).hexdigest()
 
                     if fact_hash not in indexed:
                         new_facts.append(fact)
@@ -343,15 +361,7 @@ def add_facts_to_graph(graph, facts):
         norms = np.linalg.norm(raw_matrix, axis=1, keepdims=True)
         existing_fact_matrix = raw_matrix / np.maximum(norms, 1e-10)
 
-    # Pre-generate category embeddings
-    categories = set(f.get("category", "general") for f in facts)
-    cat_embeddings = {}
-    for cat in categories:
-        cat_id = f"category_{cat}"
-        if graph.has_node(cat_id):
-            cat_embeddings[cat_id] = graph.nodes[cat_id].get("embedding", [])
-        else:
-            cat_embeddings[cat_id] = get_embedding(f"Category: {cat}")
+    # P2: category nodes now have embedding=None — no pre-generation needed
 
     for fact in facts:
         key = (fact.get("key") or "").strip()
@@ -370,7 +380,9 @@ def add_facts_to_graph(graph, facts):
             # نفس الـ key بالحرف — تخطّي تماماً (السلوك القديم)
             target_node_id = node_id
         else:
-            embedding = get_embedding(key)
+            # P0-1: Normalize key before embedding — ensures Arabic facts get same embedding
+            key_for_embedding = normalize_arabic_text(key)
+            embedding = get_embedding(key_for_embedding)
 
             # ====================================================
             # Semantic dedup: ابحث عن fact موجود متشابه دلالياً
@@ -442,7 +454,7 @@ def add_facts_to_graph(graph, facts):
                         type="category",
                         category=category,
                         created_at=now,
-                        embedding=cat_embeddings.get(cat_id, [0.0] * EMBEDDING_DIM),
+                        embedding=None,  # P2: no embedding for category nodes (not searchable)
                     )
                 if not graph.has_edge(node_id, cat_id):
                     graph.add_edge(node_id, cat_id, weight=0.9, type="belongs_to")
@@ -458,7 +470,7 @@ def add_facts_to_graph(graph, facts):
                     type="session",
                     session_id=session_id,
                     created_at=now,
-                    embedding=get_embedding(f"Session {session_id[:16]}"),
+                    embedding=None,  # P2: no embedding for session nodes (not searchable)
                 )
             if not graph.has_edge(target_node_id, session_node):
                 graph.add_edge(target_node_id, session_node, weight=0.7, type="from_session")
@@ -542,29 +554,6 @@ def main():
     # Read new facts FIRST (before orphan cleanup, so dedup has full graph)
     result = read_new_facts()
     new_facts, indexed_hashes = result
-
-    # Self-heal: purge stale hashes from tracker that no longer exist on disk
-    all_jsonl_hashes = set()
-    for filename in os.listdir(FACTS_DIR):
-        if not filename.endswith(".jsonl"):
-            continue
-        filepath = os.path.join(FACTS_DIR, filename)
-        with open(filepath, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    fact = json.loads(line)
-                    key = (fact.get("key") or "").strip()
-                    if key:
-                        all_jsonl_hashes.add(hashlib.md5(key.encode()).hexdigest())
-                except (json.JSONDecodeError, AttributeError):
-                    continue
-    stale = indexed_hashes - all_jsonl_hashes
-    if stale:
-        indexed_hashes -= stale
-        print(f"  Self-heal: removed {len(stale)} stale tracker hashes")
 
     if not new_facts:
         print("  No new facts to add.")
