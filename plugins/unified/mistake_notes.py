@@ -92,6 +92,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS mistake_notes_fts USING fts5(
 )
 """
 
+# Trigram FTS5 for Arabic substring search (matches hermes_state.py pattern).
+# The default unicode61 tokenizer splits on word boundaries — 'الذاكرة' is one
+# token, so searching 'ذاكرة' (without الـ) returns 0 results.  The trigram
+# tokenizer creates overlapping 3-byte sequences so substring queries work for
+# any script including Arabic.
+MISTAKE_FTS_TRIGRAM_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS mistake_notes_fts_trigram USING fts5(
+    description, context, fix, tags,
+    content='mistake_notes', content_rowid='id',
+    tokenize='trigram'
+)
+"""
+
 
 class MistakeTracker:
     """P4: Tracks and manages mistake notes."""
@@ -131,6 +144,7 @@ class MistakeTracker:
         try:
             conn.execute(MISTAKE_TABLE_SQL)
             conn.execute(MISTAKE_FTS_SQL)
+            conn.execute(MISTAKE_FTS_TRIGRAM_SQL)
             conn.commit()
             return True
         except Exception as e:
@@ -215,7 +229,7 @@ class MistakeTracker:
                 conn.commit()
                 mistake_id = cursor.lastrowid
 
-                # Update FTS index
+                # Update standard FTS index
                 try:
                     conn.execute(
                         "INSERT INTO mistake_notes_fts (rowid, description, context, fix, tags) VALUES (?, ?, ?, ?, ?)",
@@ -224,6 +238,16 @@ class MistakeTracker:
                     conn.commit()
                 except Exception:
                     pass  # FTS is optional
+
+                # Update trigram FTS index (Arabic/substring matching)
+                try:
+                    conn.execute(
+                        "INSERT INTO mistake_notes_fts_trigram (rowid, description, context, fix, tags) VALUES (?, ?, ?, ?, ?)",
+                        (mistake_id, description, context, fix, tags_json),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
 
                 logger.info("Recorded mistake #%d: [%s/%s] %s",
                            mistake_id, category, severity, description[:50])
@@ -244,7 +268,10 @@ class MistakeTracker:
     ) -> List[Dict]:
         """Search mistake notes.
 
-        Uses FTS if available, falls back to LIKE search.
+        Three-tier search (matches hermes_state.py pattern):
+        1. Standard FTS5 (unicode61) — fast exact word matches
+        2. Trigram FTS5 — Arabic/substring matches
+        3. LIKE fallback — very short queries (< 3 bytes)
         """
         conn = self._get_conn()
         if conn is None:
@@ -253,43 +280,62 @@ class MistakeTracker:
         if not self.ensure_table():
             return []
 
-        # Try FTS search first
-        try:
-            fts_query = query.replace(' ', ' OR ')
-            sql = """
+        if not query:
+            # No query — filter by category/severity/session only
+            return self._search_like(query, category, severity, session_id, limit)
+
+        # Build common WHERE clauses
+        where_clauses = []
+        extra_params = []
+        if category:
+            where_clauses.append("mn.category = ?")
+            extra_params.append(category)
+        if severity:
+            where_clauses.append("mn.severity = ?")
+            extra_params.append(severity)
+        if session_id:
+            where_clauses.append("mn.session_id = ?")
+            extra_params.append(session_id)
+        extra = ""
+        if where_clauses:
+            extra = " AND " + " AND ".join(where_clauses)
+
+        order_by = "ORDER BY mn.recurrence_count DESC, mn.created_at DESC"
+
+        def _fts_search(table: str, q: str) -> List[Dict]:
+            """Run FTS search on a specific table."""
+            sql = f"""
                 SELECT mn.id, mn.description, mn.category, mn.severity,
                        mn.context, mn.fix, mn.fix_verified, mn.created_at,
                        mn.session_id, mn.tags, mn.recurrence_count
                 FROM mistake_notes mn
-                JOIN mistake_notes_fts fts ON mn.id = fts.rowid
-                WHERE mistake_notes_fts MATCH ?
+                JOIN {table} fts ON mn.id = fts.rowid
+                WHERE fts MATCH ?{extra}
+                {order_by}
+                LIMIT ?
             """
-            params = [fts_query]
+            cursor = conn.execute(sql, [q] + extra_params + [limit])
+            return [self._row_to_dict(row) for row in cursor.fetchall()]
 
-            if category:
-                sql += " AND mn.category = ?"
-                params.append(category)
-            if severity:
-                sql += " AND mn.severity = ?"
-                params.append(severity)
-            if session_id:
-                sql += " AND mn.session_id = ?"
-                params.append(session_id)
-
-            sql += " ORDER BY mn.recurrence_count DESC, mn.created_at DESC LIMIT ?"
-            params.append(limit)
-
-            cursor = conn.execute(sql, params)
-            fts_results = [self._row_to_dict(row) for row in cursor.fetchall()]
-
-            # Fallback to LIKE if FTS returns no results (Arabic tokenization issue)
-            if not fts_results and query:
-                return self._search_like(query, category, severity, session_id, limit)
-            return fts_results
-
+        # 1. Standard FTS5 (exact word matches)
+        fts_query = query.replace(' ', ' OR ')
+        try:
+            results = _fts_search('mistake_notes_fts', fts_query)
+            if results:
+                return results
         except Exception:
-            # Fallback to LIKE search
-            return self._search_like(query, category, severity, session_id, limit)
+            pass
+
+        # 2. Trigram FTS5 (Arabic/substring matching)
+        try:
+            results = _fts_search('mistake_notes_fts_trigram', fts_query)
+            if results:
+                return results
+        except Exception:
+            pass
+
+        # 3. LIKE fallback (very short queries)
+        return self._search_like(query, category, severity, session_id, limit)
 
     def _search_like(
         self,
@@ -429,14 +475,22 @@ class MistakeTracker:
 
         try:
             conn.execute("DELETE FROM mistake_notes WHERE id = ?", (mistake_id,))
-            # FTS5 external content table: use special 'delete' command
+            # Standard FTS5 external content table: use special 'delete' command
             try:
                 conn.execute(
                     "INSERT INTO mistake_notes_fts(mistake_notes_fts, rowid) VALUES('delete', ?)",
                     (mistake_id,),
                 )
             except Exception:
-                pass  # FTS delete is best-effort
+                pass
+            # Trigram FTS5 external content table: also delete
+            try:
+                conn.execute(
+                    "INSERT INTO mistake_notes_fts_trigram(mistake_notes_fts_trigram, rowid) VALUES('delete', ?)",
+                    (mistake_id,),
+                )
+            except Exception:
+                pass
             conn.commit()
             return True
         except Exception as e:
