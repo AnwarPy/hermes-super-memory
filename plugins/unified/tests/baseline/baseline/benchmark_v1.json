@@ -1,0 +1,13 @@
+{
+  "first_search_ms": 84.16247367858887,
+  "warm_search_avg_ms": 81.28948211669922,
+  "warm_search_p95_ms": 86.2419605255127,
+  "fts5_arabic_avg_ms": 0.1274585723876953,
+  "fts5_arabic_max_ms": 0.4019737243652344,
+  "timestamp": 1778047690.5599265,
+  "test_count": {
+    "arabic_queries": 10,
+    "english_queries": 10,
+    "edge_cases": 5
+  }
+}

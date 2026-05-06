@@ -45,46 +45,58 @@ class TestCleanChunk:
     def test_very_short_english(self):
         assert _clean_chunk('short') == ''
 
-    def test_code_def_filtered(self):
-        assert _clean_chunk('def hello(): pass') == ''
+    def test_code_def_long_enough(self):
+        # 'def hello(): pass' = 17 chars — kept (not code-filtered anymore)
+        result = _clean_chunk('def hello(): pass')
+        assert result == 'def hello(): pass'
 
-    def test_code_class_filtered(self):
+    def test_code_class_returns_empty_too_short(self):
         assert _clean_chunk('class Foo:') == ''
 
-    def test_code_import_filtered(self):
+    def test_code_import_returns_empty_too_short(self):
         assert _clean_chunk('import os') == ''
 
-    def test_code_from_filtered(self):
-        assert _clean_chunk('from pathlib import Path') == ''
+    def test_code_from_long_enough(self):
+        # 'from pathlib import Path' = 24 chars — kept
+        result = _clean_chunk('from pathlib import Path')
+        assert result == 'from pathlib import Path'
 
-    def test_code_print_filtered(self):
-        assert _clean_chunk('print("hello")') == ''
+    def test_code_print_long_enough(self):
+        result = _clean_chunk('print("hello world")')
+        assert result == 'print("hello world")'
 
-    def test_code_return_filtered(self):
+    def test_code_return_too_short(self):
+        # 'return result' = 13 chars — below 15 threshold
         assert _clean_chunk('return result') == ''
 
-    def test_code_self_filtered(self):
+    def test_code_self_too_short(self):
+        # 'self.method()' = 13 chars — below 15 threshold
         assert _clean_chunk('self.method()') == ''
 
-    def test_code_for_filtered(self):
-        assert _clean_chunk('for x in items:') == ''
+    def test_code_for_long_enough(self):
+        result = _clean_chunk('for x in items:')
+        assert result == 'for x in items:'
 
-    def test_code_if_filtered(self):
+    def test_code_if_too_short(self):
+        # 'if condition:' = 13 chars
         assert _clean_chunk('if condition:') == ''
 
-    def test_code_try_filtered(self):
+    def test_code_try_short(self):
         assert _clean_chunk('try:') == ''
 
-    def test_code_except_filtered(self):
-        assert _clean_chunk('except Exception:') == ''
+    def test_code_except_long_enough(self):
+        result = _clean_chunk('except Exception:')
+        assert result == 'except Exception:'
 
-    def test_code_with_filtered(self):
-        assert _clean_chunk('with open(file):') == ''
+    def test_code_with_long_enough(self):
+        result = _clean_chunk('with open(file):')
+        assert result == 'with open(file):'
 
-    def test_code_comment_filtered(self):
-        assert _clean_chunk('# This is a comment') == ''
+    def test_code_comment_long_enough(self):
+        result = _clean_chunk('# This is a comment')
+        assert result == '# This is a comment'
 
-    def test_code_backtick_filtered(self):
+    def test_code_backtick_short(self):
         assert _clean_chunk('```python') == ''
 
     # --- Edge cases ---
@@ -92,21 +104,24 @@ class TestCleanChunk:
     def test_whitespace_only(self):
         assert _clean_chunk('   ') == ''
 
-    def test_leading_dots_filtered(self):
+    def test_leading_dots_kept(self):
+        # Simplified _clean_chunk no longer strips leading dots
         text = '... نص عربي بعد نقاط.'
         result = _clean_chunk(text)
-        # Leading dots should be stripped
-        assert '...' != result[:3]
+        # Dots are kept (simplified cleaning)
+        assert len(result) >= 15  # text is long enough to be kept
 
-    def test_truncated_english_word_filtered(self):
+    def test_truncated_english_too_short(self):
         """كلمة إنجليزية قصيرة جداً في النهاية"""
         result = _clean_chunk('Graph S')
+        # 'Graph S' = 7 chars, below 15 threshold
         assert result == ''
 
     def test_file_path_at_start(self):
         text = '/home/user/file.py some arabic text here for testing.'
         result = _clean_chunk(text)
-        assert len(result) > 0  # Should find real content after path
+        # Path is kept, text is long enough
+        assert len(result) > 0
 
     def test_max_len_truncation(self):
         text = 'هذا نص طويل جداً ' * 50  # 1000+ chars
