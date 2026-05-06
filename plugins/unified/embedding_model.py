@@ -8,8 +8,11 @@
 """
 
 from typing import List, Optional, Union
+import logging
 import torch
 from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger(__name__)
 
 # Global singleton cache — مشاركة النموذج عالمياً
 _MODEL_SINGLETON = {}
@@ -43,11 +46,10 @@ class EmbeddingModel:
         # Singleton check — هل النموذج محمّل مسبقاً؟
         cache_key = f"{model_name}_{device}_{use_fp16}"
         if cache_key in _MODEL_SINGLETON:
-            print(f"✓ نموذج محمّل مسبقاً: {model_name} (من الكاش)")
+            logger.info("✓ نموذج محمّل مسبقاً: %s (من الكاش)", model_name)
             self.model = _MODEL_SINGLETON[cache_key]
         else:
-            print(f"جاري تحميل نموذج التضمين: {model_name}")
-            print(f"الجهاز: {self.device}")
+            logger.info("جاري تحميل نموذج التضمين: %s | الجهاز: %s", model_name, self.device)
             
             # تحميل النموذج
             self.model = SentenceTransformer(
@@ -61,10 +63,8 @@ class EmbeddingModel:
             
             # حفظ في الكاش
             _MODEL_SINGLETON[cache_key] = self.model
-            print(f"✓ نموذج محمّل: {model_name}")
-            print(f"  - الأبعاد: {self.dimension}")
-            print(f"  - الحد الأقصى: {self.max_tokens} tokens")
-            print(f"  - FP16: {use_fp16}")
+            logger.info("✓ نموذج محمّل: %s | الأبعاد: %d | الحد الأقصى: %d tokens | FP16: %s",
+                        model_name, self.dimension, self.max_tokens, use_fp16)
     
     def _select_device(self, preferred_device: str) -> str:
         """اختيار الجهاز المتاح
@@ -85,7 +85,7 @@ class EmbeddingModel:
             return "mps"
         else:
             if preferred_device not in ("cpu", "auto"):
-                print(f"تحذير: {preferred_device} غير متاح، جاري استخدام CPU")
+                logger.warning("تحذير: %s غير متاح، جاري استخدام CPU", preferred_device)
             return "cpu"
     
     def embed_query(self, text: str) -> List[float]:
@@ -129,7 +129,7 @@ class EmbeddingModel:
             # P0-2: No prompt prefix on passages — improves retrieval recall ~5%
             normalize_embeddings=True,
             batch_size=batch_size,
-            show_progress_bar=True,
+            show_progress_bar=False,  # P4: لا نلوث الـ logs بـ progress bar
         )
         
         return embeddings.tolist()

@@ -46,7 +46,7 @@ def _get_memory_db():
     global _memory_db
     if _memory_db is None:
         try:
-            _scripts_dir = os.path.expanduser("~/.hermes/../hermes-super-memory/scripts")
+            _scripts_dir = os.path.expanduser("~/hermes-super-memory/scripts")
             if os.path.isdir(_scripts_dir) and _scripts_dir not in sys.path:
                 sys.path.insert(0, _scripts_dir)
             from db import MemoryDB
@@ -59,11 +59,23 @@ def _get_memory_db():
 logger = logging.getLogger(__name__)
 
 
+def _format_age(seconds):
+    """P1: تنسيق عمر النتيجة للعرض."""
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{int(seconds/60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds/3600)}h ago"
+    return f"{int(seconds/86400)}d ago"
+
+
 def _clean_chunk(content, max_len=300):
     """تنظيف بسيط للنصوص — بديل 10 سطور لـ 165 سطر regex هش.
     
     P1: الحقائق من LLM نظيفة أصلاً. هذا يكفي.
     FTS5 snippets تستخدم نفس الدالة.
+    حد أدنى 15 حرف للمحتوى المفيد.
     """
     if not content:
         return ""
@@ -79,12 +91,18 @@ def _clean_chunk(content, max_len=300):
 
 
 class QueryResultCache:
-    """كاش لنتائج البحث — يقلل وقت الاستعلامات المتكررة 98%+"""
+    """كاش لنتائج البحث — يقلل وقت الاستعلامات المتكررة 98%+
+    
+    P3: Lock لحماية thread-safety + max_size لمنع memory leak.
+    """
+    
+    MAX_SIZE = 500  # P3: حد أعلى للكاش
     
     def __init__(self, ttl_seconds=300):
         self._cache = {}
         self._timestamps = {}
         self.ttl = ttl_seconds
+        self._lock = threading.Lock()  # P3: thread safety
     
     def _make_key(self, query, session_id, max_age_days):
         """إنشاء مفتاح فريد للكاش"""
@@ -97,22 +115,25 @@ class QueryResultCache:
         import time
         key = self._make_key(query, session_id, max_age_days)
         
-        if key in self._cache:
-            age = time.time() - self._timestamps[key]
-            if age < self.ttl:
-                return self._cache[key]
-            else:
-                # منتهي الصلاحية
-                del self._cache[key]
-                del self._timestamps[key]
+        with self._lock:  # P3: thread safety
+            if key in self._cache:
+                age = time.time() - self._timestamps[key]
+                if age < self.ttl:
+                    return self._cache[key]
+                else:
+                    del self._cache[key]
+                    del self._timestamps[key]
         return None
     
     def set(self, query, result, session_id="", max_age_days=None):
         """حفظ نتيجة في الكاش"""
         import time
         key = self._make_key(query, session_id, max_age_days)
-        self._cache[key] = result
-        self._timestamps[key] = time.time()
+        with self._lock:  # P3: thread safety + size cap
+            if len(self._cache) > self.MAX_SIZE:
+                self.cleanup_expired()
+            self._cache[key] = result
+            self._timestamps[key] = time.time()
     
     def clear(self):
         """تنظيف الكاش بالكامل"""
@@ -166,10 +187,11 @@ class GraphCache:
     def get(self, project_name, loader_fn):
         """جلب رسم من الذاكرة أو تحميله مع mtime check."""
         import os
+        graphs_dir = os.path.expanduser("~/.hermes/graphs")
+        graph_file = os.path.join(graphs_dir, project_name, "graph.json")
+
         if project_name in self._graphs:
             # P1: Check if file was modified since last load
-            graphs_dir = os.path.expanduser("~/.hermes/graphs")
-            graph_file = os.path.join(graphs_dir, project_name, "graph.json")
             if os.path.exists(graph_file):
                 current_mtime = os.path.getmtime(graph_file)
                 if self._mtimes.get(project_name, 0) < current_mtime:
@@ -229,6 +251,7 @@ class UnifiedMemoryProvider(MemoryProvider):
         self._ft_db = None
         self._model_loaded = False  # للخلفية Preloading
         self._model_loading_thread = None  # مؤشر على خيط التحميل
+        self._model_ready = threading.Event()  # P0: Event للمزامنة الآمنة
     
     @property
     def name(self):
@@ -289,24 +312,51 @@ class UnifiedMemoryProvider(MemoryProvider):
         self._initialized = True
         logger.info("UnifiedMemoryProvider v3.5 fully initialized")
         
-        # Background Preloading — تم إزالته لتجنب race conditions
+        # Background Preloading — P0: آمن مع threading.Event
         self._preload_model_background()
     
     def _preload_model_background(self):
-        """تحميل نموذج التضمين عند أول طلب (Lazy Loading)
+        """تحميل نموذج التضمين في الخلفية (Background Preloading)
         
-        ملاحظة: أزلنا الـ background preloading لأنه كان يسبب:
-        - race conditions مع الـ main thread
-        - تحميل مكرر للنموذج
-        - self-join errors
+        P0: بدلاً من pass (كان يسبب cold start 17.5 ثانية)،
+        نستخدم thread خلفي مع threading.Event للمزامنة الآمنة.
         """
-        pass  # Lazy loading يتم في _get_graphify() عند أول طلب فعلي
+        if self._model_loading_thread is not None and self._model_loading_thread.is_alive():
+            return  # حماية من التحميل المكرر
+        
+        def _worker():
+            try:
+                with self._graphify_lock:
+                    if self.graphify is None:
+                        self._init_graphify()
+                        # Warmup: استعلام وهمي يحرّك CUDA kernels
+                        if self.graphify and hasattr(self.graphify, 'embedding'):
+                            try:
+                                self.graphify.embedding.embed_query("warmup")
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning("Background preload failed: %s", e)
+            finally:
+                # Event يتعيّن دائماً — حتى لو فشل، ما يعلق prefetch()
+                self._model_ready.set()
+        
+        self._model_loading_thread = threading.Thread(
+            target=_worker, daemon=True, name="bge-m3-preload"
+        )
+        self._model_loading_thread.start()
     
     def _get_graphify(self):
-        """تهيئة Graphify عند أول طلب فقط (Lazy Loading — thread-safe)"""
+        """تهيئة Graphify عند أول طلب فقط (Lazy Loading — thread-safe)
+        
+        P0: إذا كان التحميل الخلفي جارياً، ننتظره (max 30s) بدل البدء من الصفر.
+        """
         if self.graphify is None:
+            # انتظر التحميل الخلفي إن كان جارياً
+            if self._model_loading_thread and self._model_loading_thread.is_alive():
+                self._model_ready.wait(timeout=30)
             with self._graphify_lock:
-                if self.graphify is None:  # double-checked locking
+                if self.graphify is None:
                     self._init_graphify()
         return self.graphify
     
@@ -371,7 +421,7 @@ class UnifiedMemoryProvider(MemoryProvider):
             "Use unified_search for all memory layers.\n"
         )
     
-    def _search_graph_cached(self, query, top_k_per_project=2, max_age_cutoff=None):
+    def _search_graph_cached(self, query, top_k_per_project=2, max_age_cutoff=None, session_id=""):
         """بحث دلالي SQLite-native — P6 final.
         
         Reads directly from MemoryDB (hermes_memory.db).
@@ -387,7 +437,8 @@ class UnifiedMemoryProvider(MemoryProvider):
         if not has_word:
             return []
         
-        cache_hit = self._query_cache.get(query)
+        # P4: Pass session_id for consistent cache key with prefetch
+        cache_hit = self._query_cache.get(query, session_id)
         if cache_hit is not None:
             return cache_hit
         
@@ -573,7 +624,7 @@ class UnifiedMemoryProvider(MemoryProvider):
         fts5_results = []
         
         # Graph search (Lazy Loading — يحمل المشاريع عند الطلب فقط)
-        graph_results = self._search_graph_cached(query, top_k_per_project=2, max_age_cutoff=graph_cutoff)
+        graph_results = self._search_graph_cached(query, top_k_per_project=2, max_age_cutoff=graph_cutoff, session_id=session_id)
         
         # FTS5 (مع فلتر زمني configurable واستبعاد tool output والجلسة الحالية)
         if self._ft_db:
@@ -613,6 +664,7 @@ class UnifiedMemoryProvider(MemoryProvider):
                             'content': cleaned,
                             'type': 'session',
                             'project': 'sessions',
+                            'timestamp': msg_ts,  # P1: تمرير الوقت للـ source label
                         })
                 
                 fts5_results = fts5_formatted
@@ -642,11 +694,27 @@ class UnifiedMemoryProvider(MemoryProvider):
         if results:
             # ترتيب حسب RRF score (إن وجد) أو similarity
             results.sort(key=lambda x: x.get('rrf_score', x['similarity']), reverse=True)
+            now = _time.time()  # P1: مرجع الوقت لـ source label
             lines = ["## Memory Context\n"]
             for r in results[:5]:
-                lang_tag = 'arabic' if any('\u0600' <= c <= '\u06FF' for c in r['content'][:20]) else 'english'
+                rtype = r.get('type', 'unknown')
+                project = r.get('project', '')
+                expanded = r.get('expanded', False)
+                
+                # P1: source label واضح بدل lang_tag
+                if rtype == 'session':
+                    ts = r.get('timestamp', 0)
+                    age = _format_age(now - ts) if ts else ''
+                    source = f"session:{age}" if age else "session"
+                elif rtype == 'fact':
+                    source = f"graph:{project}"
+                    if expanded:
+                        source += "·1hop"
+                else:
+                    source = rtype
+                
                 score = r.get('rrf_score', r['similarity'])
-                lines.append("- [%.2f][%s] %s" % (score, lang_tag, r['content']))
+                lines.append("- [%.2f][%s] %s" % (score, source, r['content']))
             result_text = "\n".join(lines)
             
             # حفظ في الكاش قبل الإرجاع
@@ -720,7 +788,7 @@ class UnifiedMemoryProvider(MemoryProvider):
             return {"error": "Graphify not initialized"}
         
         query = args.get("query", "")
-        limit = args.get("limit", 10)
+        limit = int(args.get("limit", 10))  # P2: cast to int (كان يوصل string من JSON)
         
         # فلتر: استعلام فارغ أو غير صالح
         if not query or len(query.strip()) < 2:
@@ -769,7 +837,8 @@ class UnifiedMemoryProvider(MemoryProvider):
         
         results.sort(key=lambda x: x.get("similarity", 0), reverse=True)
         
-        return {"query": query, "results": results[:limit], "total": len(results)}
+        final = results[:limit]
+        return {"query": query, "results": final, "total": len(final)}  # P2: total بعد القطع
     
     def _tool_graph_index(self, args):
         graphify = self._get_graphify()
