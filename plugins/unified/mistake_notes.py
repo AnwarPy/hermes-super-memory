@@ -317,8 +317,10 @@ class MistakeTracker:
             cursor = conn.execute(sql, [q] + extra_params + [limit])
             return [self._row_to_dict(row) for row in cursor.fetchall()]
 
-        # 1. Standard FTS5 (exact word matches)
-        fts_query = query.replace(' ', ' OR ')
+        # Normalize query for better Arabic FTS5 matching (hamza, alef, etc.)
+        from .arabic_normalizer import normalize_query
+        normalized_query = normalize_query(query)
+        fts_query = normalized_query.replace(' ', ' OR ')
         try:
             results = _fts_search('mistake_notes_fts', fts_query)
             if results:

@@ -41,7 +41,10 @@ from unified.cache import QueryResultCache, GraphCache
 from unified.memory_db import _get_memory_db
 from unified.agent_id import AgentIdMixin
 
-# P1b: Auto consolidation (optional — import on demand)
+# P1b: Auto consolidation (optional — import on demand).
+# Kept commented out because consolidation is a heavy, batch operation
+# that should be triggered manually or via a cron job — NOT on every session
+# initialize(). To enable: uncomment and call from a scheduled task.
 # from unified.consolidation import MemoryConsolidator
 
 logger = logging.getLogger(__name__)
@@ -555,13 +558,9 @@ class UnifiedMemoryProvider(MemoryProvider, AgentIdMixin):
             lambda_decay=lambda_decay,
         )
         
-        # إزالة التكرار النهائي
-        results = []
-        for r in ranked_results:
-            h = hashlib.md5(r['content'].encode('utf-8')).hexdigest()
-            if h not in seen_hashes:
-                seen_hashes.add(h)
-                results.append(r)
+        # إزالة التكرار — _rerank_rrf() already deduplicates via seen_hashes,
+        # so ranked_results is already clean. Just copy to preserve order.
+        results = list(ranked_results)
         
         # ترتيب وإخراج
         if results:
@@ -662,7 +661,8 @@ class UnifiedMemoryProvider(MemoryProvider, AgentIdMixin):
                 return json.dumps({"error": "Unknown tool: %s" % tool_name})
         except Exception as e:
             logger.error("Tool call error: %s", e)
-            return json.dumps({"error": str(e)})
+            # P3-fix: Return generic error to avoid leaking internal paths/stack traces
+            return json.dumps({"error": "Internal error occurred"})
     
     def _tool_unified_search(self, args):
         graphify = self._get_graphify()

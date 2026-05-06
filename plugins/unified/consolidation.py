@@ -73,17 +73,31 @@ class MemoryConsolidator:
         return self._memory_db
 
     def _get_archive_conn(self):
-        """Get SQLite connection for archive operations."""
+        """Get SQLite connection for archive operations.
+
+        P1-fix: Reuse the existing MemoryDB connection to avoid
+        'database is locked' errors from concurrent connections.
+        Falls back to a new connection only if MemoryDB is unavailable.
+
+        Returns (conn, is_shared) — callers MUST only close if is_shared is False.
+        """
+        db = self._get_db()
+        if db is not None:
+            conn = getattr(db, 'conn', None)
+            if conn is not None:
+                return conn, True  # shared — do NOT close
+
+        # Fallback: separate connection (safe to close)
         db_path = self._get_db_path()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        return sqlite3.connect(db_path)
+        return sqlite3.connect(db_path), False
 
     def _ensure_archive_table(self):
         """Create compressed_facts_archive table if it doesn't exist.
-        
+
         Note: This is called by _archive_facts which already has the connection.
         """
-        conn = self._get_archive_conn()
+        conn, shared = self._get_archive_conn()
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS compressed_facts_archive (
@@ -102,7 +116,8 @@ class MemoryConsolidator:
             logger.error("Failed to create archive table: %s", e)
             return False
         finally:
-            conn.close()
+            if not shared:
+                conn.close()
 
     def _needs_compression(self) -> bool:
         """Check if compression is needed (fact count > max_facts)."""
@@ -190,6 +205,18 @@ class MemoryConsolidator:
 
         try:
             import numpy as np
+
+            # P2-fix: Sampling for large fact sets to avoid O(n²) bottleneck.
+            # With 10K+ facts, pairwise comparison is ~50M ops — too slow.
+            MAX_COMPARISONS = 5000
+            sample_size = min(len(facts), MAX_COMPARISONS)
+            if len(facts) > MAX_COMPARISONS:
+                import random
+                rng = random.Random(42)  # deterministic seed for reproducibility
+                facts = list(facts)
+                rng.shuffle(facts)
+                facts = facts[:sample_size]
+                logger.info("Sampling %d facts from %d for consolidation", sample_size, len(facts))
 
             # Single query: fetch embeddings for all candidate facts at once
             fact_ids = [f['id'] for f in facts]
@@ -298,7 +325,7 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
         if not self.config.get('archive_enabled', True):
             return True
 
-        conn = self._get_archive_conn()
+        conn, shared = self._get_archive_conn()
         try:
             self._ensure_archive_table()
             now = time.time()
@@ -323,7 +350,8 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
             logger.error("Failed to archive facts: %s", e)
             return False
         finally:
-            conn.close()
+            if not shared:
+                conn.close()
 
     def _delete_compressed_facts(self, group: List[Dict]) -> bool:
         """Delete original facts after archiving.

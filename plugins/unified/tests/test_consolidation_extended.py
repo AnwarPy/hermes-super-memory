@@ -47,8 +47,9 @@ class TestGetArchiveConn:
     def test_get_archive_conn_returns_connection(self, tmp_path):
         consolidator = MemoryConsolidator({})
         with patch.object(consolidator, '_get_db_path', return_value=str(tmp_path / 'test.db')):
-            conn = consolidator._get_archive_conn()
+            conn, shared = consolidator._get_archive_conn()
             assert conn is not None
+            assert shared is False  # fallback path — safe to close
             conn.close()
 
     def test_get_archive_conn_creates_directory(self, tmp_path):
@@ -56,8 +57,9 @@ class TestGetArchiveConn:
         new_dir = tmp_path / 'new' / 'dir'
         db_path = str(new_dir / 'test.db')
         with patch.object(consolidator, '_get_db_path', return_value=db_path):
-            conn = consolidator._get_archive_conn()
+            conn, shared = consolidator._get_archive_conn()
             assert new_dir.exists()
+            assert shared is False
             conn.close()
 
 
