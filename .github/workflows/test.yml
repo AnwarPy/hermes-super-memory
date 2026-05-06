@@ -1,0 +1,63 @@
+name: Tests & Coverage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/unified/**"
+      - ".github/workflows/test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "plugins/unified/**"
+      - ".github/workflows/test.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r plugins/unified/tests/requirements-ci.txt
+
+      - name: Run tests with coverage
+        working-directory: plugins/unified
+        run: |
+          pytest tests/ \
+            --cov=unified \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --tb=short \
+            -v \
+            -q
+
+      - name: Upload coverage to GitHub
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: plugins/unified/coverage.xml
+          retention-days: 30
+
+      - name: Verify coverage threshold (80%)
+        working-directory: plugins/unified
+        run: |
+          COVERAGE=$(pytest tests/ --cov=unified --cov-report=term 2>&1 | grep "^TOTAL" | awk '{print $NF}' | tr -d '%')
+          echo "Coverage: ${COVERAGE}%"
+          if [ "$COVERAGE" -lt 80 ]; then
+            echo "❌ Coverage below 80% threshold: ${COVERAGE}%"
+            exit 1
+          fi
+          echo "✅ Coverage meets 80% threshold"
