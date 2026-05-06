@@ -333,10 +333,37 @@ class UnifiedMemoryProvider(MemoryProvider):
             logger.error("SQLite search error: %s", e)
             return []
     
-    def _rerank_rrf(self, graph_results, fts5_results, k=60, graph_weight=1.5, fts5_weight=1.0):
+    def _apply_decay(self, results, lambda_decay=0.01):
+        """P1a: تطبيق معامل الانخفاض الزمني على نتائج البحث.
+        
+        adjusted_score = base_score * e^(-λ * age_days)
+        λ = 0.01/يوم → نصف العمر ≈ 69 يوم
+        
+        Results بدون timestamp (مثل graph facts) تأخذ عمر افتراضي من config.
+        """
+        import math
+        now = time.time()
+        for r in results:
+            ts = r.get('timestamp', 0)
+            if ts > 0:
+                age_days = (now - ts) / 86400.0
+                decay_factor = math.exp(-lambda_decay * age_days)
+            else:
+                # No timestamp — use the similarity as-is (graph facts)
+                decay_factor = 1.0
+            # Apply decay to rrf_score or similarity
+            base = r.get('rrf_score', r.get('similarity', 0))
+            r['adjusted_score'] = base * decay_factor
+            r['decay_factor'] = decay_factor
+        return sorted(results, key=lambda x: x['adjusted_score'], reverse=True)
+
+    def _rerank_rrf(self, graph_results, fts5_results, k=60, graph_weight=1.5, fts5_weight=1.0, lambda_decay=0.0):
         """إعادة ترتيب النتائج باستخدام Reciprocal Rank Fusion (RRF)
         
         RRF يدمج قائمتين مرتبتين باستخدام: score = 1 / (k + rank)
+        
+        P1a: إذا lambda_decay > 0، يُطبق معامل الانخفاض الزمني على نتائج FTS5
+        قبل الدمج (لأن عندها timestamps).
         
         Args:
             graph_results: نتائج من Graph (قائمة dicts)
@@ -344,11 +371,25 @@ class UnifiedMemoryProvider(MemoryProvider):
             k: ثابت التنعيم (افتراضي: 60 — قيمة قياسية في الأدبيات)
             graph_weight: وزن نتائج Graph (افتراضي: 1.5 — أعلى لأن Graph أدق)
             fts5_weight: وزن نتائج FTS5 (افتراضي: 1.0)
+            lambda_decay: معامل الانخفاض الزمني (0.0 = معطّل)
         
         Returns:
             قائمة موحدة مرتبة حسب RRF score
         """
+        import math
         from collections import defaultdict
+        
+        now = time.time()
+        
+        def _apply_decay_to_result(r, now, lambda_decay):
+            """P1a: تطبيق decay على نتيجة واحدة."""
+            if lambda_decay <= 0:
+                return 1.0
+            ts = r.get('timestamp', 0)
+            if ts > 0:
+                age_days = (now - ts) / 86400.0
+                return math.exp(-lambda_decay * age_days)
+            return 1.0
         
         seen_hashes = set()
         rrf_scores = defaultdict(float)
@@ -365,16 +406,20 @@ class UnifiedMemoryProvider(MemoryProvider):
             rrf_scores[h] += score
             all_results[h] = r
         
-        # تطبيق RRF على نتائج FTS5
+        # تطبيق RRF على نتائج FTS5 (مع decay اختياري)
         for rank, r in enumerate(fts5_results):
             h = hashlib.md5(r['content'].encode('utf-8')).hexdigest()
+            
+            # P1a: حساب decay factor
+            decay_factor = _apply_decay_to_result(r, now, lambda_decay)
+            
             if h in seen_hashes:
-                # نتيجة مكررة — نضيف score إضافي
-                rrf_scores[h] += fts5_weight / (k + rank + 1) * 0.5  # 50% bonus للتكرار
+                # نتيجة مكررة — نضيف score إضافي (مخفّض بالـ decay)
+                rrf_scores[h] += fts5_weight / (k + rank + 1) * 0.5 * decay_factor
                 continue
             seen_hashes.add(h)
             
-            score = fts5_weight / (k + rank + 1)
+            score = fts5_weight / (k + rank + 1) * decay_factor
             rrf_scores[h] += score
             all_results[h] = r
         
@@ -386,6 +431,8 @@ class UnifiedMemoryProvider(MemoryProvider):
         for h, score in ranked:
             result = all_results[h].copy()
             result['rrf_score'] = score
+            # P1a: إضافة adjusted_score (نفس rrf_score لكن واضح للمستخدم)
+            result['adjusted_score'] = score
             final_results.append(result)
         
         return final_results
@@ -484,12 +531,14 @@ class UnifiedMemoryProvider(MemoryProvider):
             fts5_results = []
         
         # Re-ranking باستخدام RRF
+        lambda_decay = self.config.get('decay_lambda', 0.0)  # P1a: 0.0 = معطّل افتراضياً
         ranked_results = self._rerank_rrf(
             graph_results,
             fts5_results,
             k=60,
             graph_weight=1.5,
-            fts5_weight=1.0
+            fts5_weight=1.0,
+            lambda_decay=lambda_decay,
         )
         
         # إزالة التكرار النهائي
