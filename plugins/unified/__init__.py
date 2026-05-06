@@ -40,6 +40,9 @@ from unified.utils import _format_age, _clean_chunk
 from unified.cache import QueryResultCache, GraphCache
 from unified.memory_db import _get_memory_db, _GLOBAL_MODEL_CACHE
 
+# P1b: Auto consolidation (optional — import on demand)
+# from unified.consolidation import MemoryConsolidator
+
 logger = logging.getLogger(__name__)
 
 
