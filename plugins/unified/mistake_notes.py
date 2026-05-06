@@ -280,7 +280,12 @@ class MistakeTracker:
             params.append(limit)
 
             cursor = conn.execute(sql, params)
-            return [self._row_to_dict(row) for row in cursor.fetchall()]
+            fts_results = [self._row_to_dict(row) for row in cursor.fetchall()]
+
+            # Fallback to LIKE if FTS returns no results (Arabic tokenization issue)
+            if not fts_results and query:
+                return self._search_like(query, category, severity, session_id, limit)
+            return fts_results
 
         except Exception:
             # Fallback to LIKE search
