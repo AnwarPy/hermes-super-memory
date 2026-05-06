@@ -118,15 +118,13 @@ class TestQueryResultCacheCleanup:
         cache.cleanup_expired()
         assert cache.get("key") == "value"
 
-    def test_max_size_triggers_cleanup(self):
-        cache = QueryResultCache(ttl_seconds=60)  # Long TTL - cleanup won't remove anything
-        # Fill well beyond max size
+    def test_max_size_cleanup_called_no_crash(self):
+        cache = QueryResultCache(ttl_seconds=60)
         for i in range(cache.MAX_SIZE + 100):
             cache.set(f"key_{i}", f"value_{i}")
-        # After set triggers cleanup when over limit, cleanup won't remove fresh items
-        # So cache will still grow slightly beyond MAX_SIZE
-        # The important thing is that cleanup was called (no crash)
-        assert len(cache._cache) > cache.MAX_SIZE  # Items are fresh so they stay
+        # Cleanup was triggered — no crash occurred
+        # Items stay since TTL is long (fresh items not expired)
+        assert len(cache._cache) > cache.MAX_SIZE
 
     def test_max_size_default(self):
         cache = QueryResultCache()

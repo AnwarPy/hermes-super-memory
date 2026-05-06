@@ -39,6 +39,7 @@ import numpy as np
 from unified.utils import _format_age, _clean_chunk
 from unified.cache import QueryResultCache, GraphCache
 from unified.memory_db import _get_memory_db
+from unified.agent_id import AgentIdMixin
 
 # P1b: Auto consolidation (optional — import on demand)
 # from unified.consolidation import MemoryConsolidator
@@ -46,13 +47,14 @@ from unified.memory_db import _get_memory_db
 logger = logging.getLogger(__name__)
 
 
-class UnifiedMemoryProvider(MemoryProvider):
+class UnifiedMemoryProvider(MemoryProvider, AgentIdMixin):
     """مزود ذاكرة موحد محسّن"""
     
     _graphify_lock = threading.Lock()  # thread-safe lazy loading
     
     def __init__(self, config=None):
         self.config = config or {}
+        self._agent_id = "default"  # P5: AgentIdMixin field (init before mixin)
         self._initialized = False
         self.graphify = None
         self._graphify_config = self.config  # إصلاح: قيمة افتراضية قبل initialize()
@@ -90,7 +92,12 @@ class UnifiedMemoryProvider(MemoryProvider):
         if self._initialized:
             return
         
-        logger.info("Initializing UnifiedMemoryProvider v3.5 for session %s", session_id)
+        # P5: Set agent_id from config or kwargs
+        agent_id = kwargs.get('agent_id') or self.config.get('agent_id')
+        if agent_id:
+            self._set_agent_id(agent_id)
+        
+        logger.info("Initializing UnifiedMemoryProvider v3.5 for session %s (agent: %s)", session_id, self._get_agent_id())
         
         # Graphify — Lazy Loading (لا تهيئ هنا، التهيئة عند أول طلب فقط)
         self.graphify = None
@@ -602,6 +609,10 @@ class UnifiedMemoryProvider(MemoryProvider):
                     "properties": {
                         "query": {"type": "string", "description": "نص البحث"},
                         "limit": {"type": "integer", "default": 10},
+                        "agent_id": {
+                            "type": "string",
+                            "description": "P5: فلترة حسب معرف الوكيل (use 'all' for all agents)",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -659,19 +670,25 @@ class UnifiedMemoryProvider(MemoryProvider):
             return {"error": "Graphify not initialized"}
         
         query = args.get("query", "")
-        limit = int(args.get("limit", 10))  # P2: cast to int (كان يوصل string من JSON)
+        limit = int(args.get("limit", 10))  # P2: cast to int
+        filter_agent_id = self._get_agent_id_from_args(args)
         
         # فلتر: استعلام فارغ أو غير صالح
         if not query or len(query.strip()) < 2:
             return {"query": query, "results": [], "total": 0}
         
         # فلتر: استعلام يحتوي رموز فقط بدون كلمات حقيقية
-        # كلمة = حرف عربي/لاتيني أو رقم (ليس علامات ترقيم فقط)
         has_word = bool(re.search(r'[\u0621-\u064Aa-zA-Z0-9]', query))
         if not has_word:
             return {"query": query, "results": [], "total": 0}
         
         results = self._search_graph_cached(query, top_k_per_project=limit)
+        
+        # P5: Annotate results with agent_id
+        self._annotate_results_with_agent_id(results)
+        
+        # P5: Filter by agent_id if specified
+        results = self._filter_by_agent_id(results, filter_agent_id)
         
         # Deduplication
         seen = set()

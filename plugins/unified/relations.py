@@ -220,32 +220,36 @@ class RelationClassifier:
 
     def add_typed_relations(self, db, new_fact_id: int, existing_fact_ids: List[int]) -> int:
         """Classify and add typed relations between a new fact and existing facts.
-        
+
+        P5-fix: Batch SELECT with IN() clause instead of N+1 queries.
         Returns number of relations added.
         """
         if db is None or not existing_fact_ids:
             return 0
 
-        # Get the new fact text
         conn = getattr(db, 'conn', None)
         if conn is None:
             return 0
 
-        cursor = conn.execute("SELECT key FROM facts WHERE id = ?", [new_fact_id])
-        row = cursor.fetchone()
-        if not row:
+        # Single query: fetch new fact + all existing facts at once
+        all_ids = [new_fact_id] + list(existing_fact_ids)
+        placeholders = ','.join(['?' for _ in all_ids])
+        cursor = conn.execute(
+            f"SELECT id, key FROM facts WHERE id IN ({placeholders})",
+            all_ids,
+        )
+        fact_map = {row[0]: row[1] for row in cursor.fetchall()}
+
+        new_fact_key = fact_map.get(new_fact_id)
+        if not new_fact_key:
             return 0
 
-        new_fact_key = row[0]
         added = 0
-
         for existing_id in existing_fact_ids:
-            cursor = conn.execute("SELECT key FROM facts WHERE id = ?", [existing_id])
-            row = cursor.fetchone()
-            if not row:
+            existing_key = fact_map.get(existing_id)
+            if not existing_key:
                 continue
 
-            existing_key = row[0]
             result = self.classify_relation(existing_key, new_fact_key)
 
             if result and result['confidence'] >= self.confidence_threshold:

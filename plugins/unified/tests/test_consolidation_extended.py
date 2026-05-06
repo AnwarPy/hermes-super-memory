@@ -268,29 +268,38 @@ class TestGroupSimilarFacts:
 
         facts = [
             {'id': 'f1', 'key': 'test fact 1', 'category': 'obs', 'created_at': 1.0},
+            {'id': 'f2', 'key': 'test fact 2', 'category': 'obs', 'created_at': 2.0},
         ]
 
         mock_db = MagicMock()
         mock_conn = MagicMock()
-        # First call: get embedding for f1
-        # Second call: get all embeddings
-        def side_effect(query, params=None):
-            mock_cursor = MagicMock()
-            if 'f1' in str(params):
-                mock_cursor.fetchone.return_value = [json.dumps(vec)]
-            else:
-                mock_cursor.fetchall.return_value = [
-                    ('f1', 'test fact 1', json.dumps(vec)),
-                    ('f2', 'test fact 2', json.dumps(vec2)),
-                ]
-            return mock_cursor
 
-        mock_conn.execute.side_effect = side_effect
+        # Single query returns both facts with embeddings
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ('f1', 'test fact 1', 'obs', 1.0, json.dumps(vec)),
+            ('f2', 'test fact 2', 'obs', 2.0, json.dumps(vec2)),
+        ]
+        mock_conn.execute.return_value = mock_cursor
         mock_db.conn = mock_conn
+
         with patch.object(consolidator, '_get_db', return_value=mock_db):
             groups = consolidator._group_similar_facts(facts)
 
-        assert len(groups) >= 0  # May or may not group depending on actual similarity
+        # Verify single query was used (IN clause with placeholders)
+        mock_conn.execute.assert_called_once()
+        call_args = mock_conn.execute.call_args[0]
+        assert 'IN (' in call_args[0]
+        assert 'embedding IS NOT NULL' in call_args[0]
+
+        # Verify groups are returned with full fact dicts
+        assert isinstance(groups, list)
+        for group in groups:
+            for fact in group:
+                assert 'id' in fact
+                assert 'key' in fact
+                assert 'category' in fact
+                assert 'created_at' in fact
 
     def test_group_handles_exception(self):
         consolidator = MemoryConsolidator({})

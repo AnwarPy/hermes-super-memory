@@ -37,7 +37,7 @@ class AgentIdMixin:
     """P5: Adds agent_id tracking and filtering to memory operations."""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Don't call super().__init__ — base classes may not accept *args
         self._agent_id = DEFAULT_AGENT_ID
 
     def _get_agent_id(self) -> str:

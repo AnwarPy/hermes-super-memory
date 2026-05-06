@@ -145,6 +145,7 @@ class TestConsolidationReport:
         
         required_fields = [
             'dry_run', 'facts_before', 'facts_after',
+            'candidates_before', 'candidates_after',
             'groups_found', 'groups_compressed', 'groups_failed',
             'archived', 'errors', 'timestamp', 'status',
         ]
@@ -158,6 +159,8 @@ class TestConsolidationReport:
         assert isinstance(report['dry_run'], bool)
         assert isinstance(report['facts_before'], int)
         assert isinstance(report['facts_after'], int)
+        assert isinstance(report['candidates_before'], int)
+        assert isinstance(report['candidates_after'], int)
         assert isinstance(report['groups_found'], int)
         assert isinstance(report['groups_compressed'], int)
         assert isinstance(report['groups_failed'], int)

@@ -424,10 +424,14 @@ class MistakeTracker:
 
         try:
             conn.execute("DELETE FROM mistake_notes WHERE id = ?", (mistake_id,))
+            # FTS5 external content table: use special 'delete' command
             try:
-                conn.execute("DELETE FROM mistake_notes_fts WHERE rowid = ?", (mistake_id,))
+                conn.execute(
+                    "INSERT INTO mistake_notes_fts(mistake_notes_fts, rowid) VALUES('delete', ?)",
+                    (mistake_id,),
+                )
             except Exception:
-                pass
+                pass  # FTS delete is best-effort
             conn.commit()
             return True
         except Exception as e:

@@ -359,11 +359,11 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
 
     def consolidate(self) -> Dict[str, Any]:
         """Run the full consolidation pipeline.
-        
+
         Returns a report dict with:
         - dry_run: bool
-        - facts_before: int
-        - facts_after: int (estimated for dry run)
+        - candidates_before: int (facts eligible for compression, excludes protected)
+        - candidates_after: int (estimated remaining candidates)
         - groups_found: int
         - groups_compressed: int
         - groups_failed: int
@@ -372,8 +372,10 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
         """
         report = {
             'dry_run': self.config.get('dry_run', True),
-            'facts_before': 0,
-            'facts_after': 0,
+            'facts_before': 0,       # alias for candidates_before
+            'facts_after': 0,        # alias for candidates_after
+            'candidates_before': 0,
+            'candidates_after': 0,
             'groups_found': 0,
             'groups_compressed': 0,
             'groups_failed': 0,
@@ -390,7 +392,8 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
 
         # Get candidate facts
         facts = self._get_facts_to_compress()
-        report['facts_before'] = len(facts)
+        report['candidates_before'] = len(facts)
+        report['facts_before'] = len(facts)  # alias
 
         # Group similar facts
         groups = self._group_similar_facts(facts)
@@ -438,6 +441,8 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
             logger.info("Compressed %d facts → 1 summary (group %d)",
                        len(group), i + 1)
 
-        report['facts_after'] = report['facts_before'] - report['archived']
+        remaining = report['candidates_before'] - report['archived']
+        report['candidates_after'] = remaining
+        report['facts_after'] = remaining  # alias
         report['status'] = 'completed' if not report['errors'] else 'partial'
         return report
