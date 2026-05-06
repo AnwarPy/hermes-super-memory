@@ -613,7 +613,7 @@ if __name__ == "__main__":
     db = MemoryDB()
     db.init()
     s = db.stats()
-    print(f"Hermes Memory DB: {s['db_path']}")
+    print(f"Hermes Memory DB: {db.db_path}")
     print(f"  Live facts: {s['live_facts']}")
     print(f"  Relations: {s['relations']}")
     print(f"  DB size: {s['db_size_mb']} MB")

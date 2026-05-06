@@ -300,6 +300,7 @@ def add_facts_to_db(db: MemoryDB, facts: list):
 
         if duplicate_of is not None:
             # دمج: عزّز الموجود بدلاً من إنشاء نود جديد
+            # P6: Use db._get_conn + explicit commit (consistent with rest of method)
             conn.execute(
                 """UPDATE facts 
                    SET importance = MAX(importance, ?),
@@ -308,6 +309,7 @@ def add_facts_to_db(db: MemoryDB, facts: list):
                    WHERE id = ?""",
                 (importance, now_ts, duplicate_of)
             )
+            conn.commit()
             # احفظ الصياغة البديلة (مفيد للسياق)
             existing_aliases_json = db.get_state(f'fact_{duplicate_of}_aliases') or '[]'
             existing_aliases = json.loads(existing_aliases_json)
@@ -347,6 +349,7 @@ def add_facts_to_db(db: MemoryDB, facts: list):
                                                WHERE id = ?""",
                                             (importance, now_ts, target)
                                         )
+                                        conn.commit()  # P6: close implicit transaction
                                         decision_made = True
                                         print(f"    UPDATE: {key[:60]}... ({reason[:80]})")
                                     elif decision == "contradict":
@@ -495,7 +498,9 @@ def main():
     for fact in new_facts:
         key = (fact.get("key") or "").strip()
         if key:
-            new_hashes.add(hashlib.md5(key.encode()).hexdigest())
+            # P6: Use normalized key hash — consistent with read path
+            key_normalized = normalize_arabic_text(key)
+            new_hashes.add(hashlib.md5(key_normalized.encode()).hexdigest())
     indexed_hashes.update(new_hashes)
 
     # Orphan cleanup AFTER adding — dedup had full DB

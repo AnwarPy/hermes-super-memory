@@ -30,12 +30,31 @@ import functools
 import time
 import threading
 import sys
+import os
 import hashlib
 from pathlib import Path
 
 # Global singleton — مشاركة النموذج عالمياً لتجنب إعادة التحميل
 _GLOBAL_MODEL_CACHE = {}
 import numpy as np
+
+# P4: MemoryDB SQLite reference (lazy init — only when needed)
+_memory_db = None
+
+def _get_memory_db():
+    """Lazy-load MemoryDB singleton for graph search."""
+    global _memory_db
+    if _memory_db is None:
+        try:
+            _scripts_dir = os.path.expanduser("~/.hermes/../hermes-super-memory/scripts")
+            if os.path.isdir(_scripts_dir) and _scripts_dir not in sys.path:
+                sys.path.insert(0, _scripts_dir)
+            from db import MemoryDB
+            _memory_db = MemoryDB()
+            _memory_db.init()
+        except Exception:
+            return None
+    return _memory_db
 
 logger = logging.getLogger(__name__)
 
@@ -117,40 +136,32 @@ class QueryResultCache:
 
 
 
-# P1: Replace SQLite EmbeddingCache with lru_cache (eliminates per-miss disk I/O)
-@functools.lru_cache(maxsize=4096)
-def _cached_embedding(text_hash: str, text: str, model_id: str) -> tuple:
-    """LRU cache for embeddings — key includes text_hash for quick lookup."""
-    # This wrapper is called via _get_cached_embedding below
-    # The actual embedding computation happens in the caller
-    raise NotImplementedError("Use _get_cached_embedding instead")
-
-
-def _get_cached_embedding(embedding_model, text):
-    """Get embedding with LRU cache. Hashes text for O(1) cache lookup."""
-    import hashlib
-    text_hash = hashlib.md5(text.encode()).hexdigest()[:16]
-    # Check in-process LRU cache
-    cache_key = f"{text_hash}:{id(embedding_model)}"
-    cached = _embedding_lru_cache.get(cache_key)
-    if cached is not None:
-        return cached
-    
-    result = embedding_model.embed_query(text)
-    _embedding_lru_cache[cache_key] = result
-    return result
-
-# Global LRU cache for embeddings
-_embedding_lru_cache = {}
+# P4: SQLite-based graph search replaces NetworkX. Embedding caching handled by
+# MemoryDB.search_similar() internally (single-query load, cosine in numpy).
+# Legacy _cached_embedding removed — was raising NotImplementedError.
 
 class GraphCache:
-    """ذاكرة تخزين مؤقت للرسوم المعرفية مع mtime invalidation (P1)."""
+    """ذاكرة تخزين مؤقت للرسوم المعرفية مع mtime invalidation + LRU cap (P4)."""
+    
+    MAX_CACHED_GRAPHS = 50  # P4: Prevent unbounded memory growth
     
     def __init__(self):
         self._graphs = {}
         self._load_times = {}
         self._mtimes = {}
         self._stats = {}
+        self._access_order = []  # P4: LRU tracking
+    
+    def _evict_if_needed(self):
+        """P4: Evict least recently used graph if over capacity."""
+        while len(self._graphs) > self.MAX_CACHED_GRAPHS and self._access_order:
+            oldest = self._access_order.pop(0)
+            if oldest in self._graphs:
+                del self._graphs[oldest]
+                self._load_times.pop(oldest, None)
+                self._mtimes.pop(oldest, None)
+                self._stats.pop(oldest, None)
+                logger.debug("GraphCache: evicted %s (LRU cap=%d)", oldest, self.MAX_CACHED_GRAPHS)
     
     def get(self, project_name, loader_fn):
         """جلب رسم من الذاكرة أو تحميله مع mtime check."""
@@ -173,6 +184,11 @@ class GraphCache:
             graph = loader_fn(project_name)
             self._graphs[project_name] = graph
             self._load_times[project_name] = time.time()
+            # P6: Update LRU access order + evict if over capacity
+            if project_name in self._access_order:
+                self._access_order.remove(project_name)
+            self._access_order.append(project_name)
+            self._evict_if_needed()
             self._stats[project_name] = {
                 'nodes': graph.number_of_nodes(),
                 'edges': graph.number_of_edges(),
@@ -356,168 +372,105 @@ class UnifiedMemoryProvider(MemoryProvider):
         )
     
     def _search_graph_cached(self, query, top_k_per_project=2, max_age_cutoff=None):
-        """بحث دلالي مع caching
+        """بحث دلالي SQLite-native — P6 final.
         
-        Args:
-            query: نص الاستعلام
-            top_k_per_project: عدد النتائج القصوى لكل مشروع
-            max_age_cutoff: وقت القطع للعمر الأقصى (timestamp، اختياري)
+        Reads directly from MemoryDB (hermes_memory.db).
+        No NetworkX, no graph.json, no GraphCache needed.
         """
         import time
         _t_start = time.perf_counter()
         
-        # Lazy Loading — تهيئة Graphify عند أول طلب
-        graphify = self._get_graphify()
-        if not graphify:
-            return []
-        
-        # فلتر: استعلام فارغ أو قصير جداً
         if not query or len(query.strip()) < 2:
             return []
         
-        # فلتر: استعلام يحتوي رموز فقط بدون كلمات حقيقية
         has_word = bool(re.search(r'[\u0621-\u064Aa-zA-Z0-9]', query))
         if not has_word:
             return []
         
-        # QueryResultCache — فحص الكاش أولاً
         cache_hit = self._query_cache.get(query)
         if cache_hit is not None:
-            logger.debug("QueryResultCache hit for '%s...'", query[:40])
             return cache_hit
         
-        # توسيع الاستعلام بالمترادفات (لزيادة التطابق الدلالي)
-        # تطبيع النص العربي قبل التوسيع
-        from .arabic_normalizer import normalize_query
-        normalized_query = normalize_query(query)
-        
-        expanded_query = normalized_query
-        if self._synonym_dict:
-            words = re.split(r'\s+', normalized_query.strip())
-            synonyms_found = set()
-            for word in words:
-                word_clean = word.strip().rstrip('؟!.,:;،؛')
-                if word_clean in self._synonym_dict:
-                    # خذ أول 3 مترادفات لتجنب التوسيع المفرط
-                    for syn in self._synonym_dict[word_clean][:3]:
-                        if len(syn) > 2 and syn not in synonyms_found:
-                            synonyms_found.add(syn)
-            if synonyms_found:
-                expanded_query = query + ' ' + ' '.join(synonyms_found)
-                logger.debug("Query expanded with %d synonyms: %s", len(synonyms_found), synonyms_found)
-        
-        results = []
-        n_projects_scanned = 0
-        
-        try:
-            projects = self._get_graphify().list_projects()
-            n_projects_scanned = len(projects)
-        except Exception:
+        db = _get_memory_db()
+        if db is None:
             return []
         
-        # P1: Use in-memory LRU cache instead of SQLite EmbeddingCache
-        query_embedding = _get_cached_embedding(graphify.embedding, expanded_query)
-        if query_embedding is None:
-            # Fallback if cache miss and embed fails
-            query_embedding = graphify.embedding.embed_query(expanded_query)
-        
-        for project in projects:
-            try:
-                # Lazy Loading: تحميل المشروع فقط عند الحاجة
-                graph = self._graph_cache.get(project, self._get_graphify().storage.load)
-                if graph is None:
-                    continue
-                
-                # فلتر زمني للرسوم (بناءً على وقت تحميل الرسم)
-                if max_age_cutoff is not None:
-                    load_time = self._graph_cache._load_times.get(project, 0)
-                    if load_time < max_age_cutoff:
-                        # الرسم قديم جداً، تجاهله
-                        continue
-                
-                project_results = []
-                # Vectorized similarity — فقط عقد type='fact' (P0: skip session/category)
-                node_ids_list = []
-                embeddings_list = []
-                for node_id in graph.nodes():
-                    node_data = graph.nodes[node_id]
-                    if node_data.get("type") != "fact":
-                        continue  # P0: filter out session/category nodes
-                    node_embedding = node_data.get("embedding")
-                    if node_embedding is not None and len(node_embedding) > 0:
-                        node_ids_list.append(node_id)
-                        embeddings_list.append(node_embedding)
-                
-                if not node_ids_list:
-                    continue
-                
-                emb_matrix = np.asarray(embeddings_list, dtype=np.float32)
-                q_vec = np.asarray(query_embedding, dtype=np.float32)
-                
-                # تطبيع
-                emb_norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-                emb_matrix = emb_matrix / np.maximum(emb_norms, 1e-10)
-                q_norm = np.linalg.norm(q_vec)
-                q_vec = q_vec / max(q_norm, 1e-10)
-                
-                # عملية واحدة بدلاً من N
-                sims = emb_matrix @ q_vec  # shape: (N,)
-                
-                # اختر الفائزين فقط
-                above = np.where(sims >= 0.5)[0]
-                top_indices = above[np.argsort(-sims[above])][:top_k_per_project]
-                
-                # P0: Expand 1-hop along 'similar' edges (weight >= 0.85)
-                top_node_ids = set(node_ids_list[idx] for idx in top_indices)
-                expanded_ids = set(top_node_ids)
-                for idx in top_indices:
-                    nid = node_ids_list[idx]
-                    for neighbor in graph.neighbors(nid):
-                        edge_data = graph[nid][neighbor]
-                        if edge_data.get("type") == "similar" and edge_data.get("weight", 0) >= 0.85:
-                            if graph.nodes[neighbor].get("type") == "fact" and neighbor not in expanded_ids:
-                                expanded_ids.add(neighbor)
-                
-                # Score expanded nodes
-                for nid in expanded_ids:
-                    content = graph.nodes[nid].get("content", "")
-                    cleaned = _clean_chunk(content)
-                    if cleaned:
-                        nid_idx = node_ids_list.index(nid) if nid in node_ids_list else -1
-                        if nid_idx >= 0:
-                            sim = float(sims[nid_idx])
-                        else:
-                            # Re-compute similarity for expanded-only nodes
-                            n_emb = np.asarray(graph.nodes[nid]["embedding"], dtype=np.float32)
-                            n_norm = np.linalg.norm(n_emb)
-                            if n_norm > 1e-10:
-                                n_emb = n_emb / n_norm
-                            sim = float(n_emb @ q_vec)
-                        project_results.append({
-                            'similarity': sim,
-                            'content': cleaned,
-                            'type': 'fact',
-                            'project': project,
-                            'expanded': nid not in top_node_ids,
-                        })
-                
-                project_results.sort(key=lambda x: x['similarity'], reverse=True)
-                results.extend(project_results[:top_k_per_project])
+        try:
+            graphify = self._get_graphify()
+            if not graphify:
+                return []
             
-            except Exception as e:
-                logger.debug("Graph search error for %s: %s", project, e)
-        
-        results.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        # P5: Latency telemetry
-        _elapsed_ms = (time.perf_counter() - _t_start) * 1000
-        logger.debug("graph_search: %.1fms | n_projects=%d | n_results=%d | query='%s'",
-                      _elapsed_ms, n_projects_scanned, len(results), query[:60])
-        
-        # QueryResultCache — حفظ النتائج قبل الإرجاع
-        self._query_cache.set(query, results[:])
-        
-        return results
+            from .arabic_normalizer import normalize_query
+            normalized_query = normalize_query(query)
+            expanded_query = normalized_query
+            if self._synonym_dict:
+                words = re.split(r'\s+', normalized_query.strip())
+                syns = set()
+                for w in words:
+                    wc = w.strip().rstrip('؟!.,:;،؛')
+                    if wc in self._synonym_dict:
+                        for s in self._synonym_dict[wc][:3]:
+                            if len(s) > 2: syns.add(s)
+                if syns:
+                    expanded_query = query + ' ' + ' '.join(syns)
+            
+            query_embedding = graphify.embedding.embed_query(expanded_query)
+            sqlite_results = db.search_similar(query_embedding, top_k=top_k_per_project * 3)
+            
+            results = []
+            seen_ids = set()
+            
+            for r in sqlite_results:
+                cleaned = _clean_chunk(r['key'])
+                if cleaned and r['id'] not in seen_ids:
+                    seen_ids.add(r['id'])
+                    results.append({
+                        'similarity': r['similarity'],
+                        'content': cleaned,
+                        'type': 'fact',
+                        'project': 'hermes-memory',
+                        'expanded': False,
+                    })
+            
+            # 1-hop neighbor expansion via fact_relations
+            if results and len(sqlite_results) >= 2:
+                neighbor_ids = set()
+                for r in sqlite_results[:2]:
+                    nbrs = db.get_neighbors(r['id'], kind='similar')
+                    for n in nbrs[:2]:
+                        if n['id'] not in seen_ids:
+                            neighbor_ids.add(n['id'])
+                
+                for nid in neighbor_ids:
+                    n_fact = db.get_fact(nid)
+                    if n_fact and n_fact.get('embedding'):
+                        n_emb = np.asarray(n_fact['embedding'], dtype=np.float32)
+                        q_vec = np.asarray(query_embedding, dtype=np.float32)
+                        n_norm = np.linalg.norm(n_emb)
+                        q_norm = np.linalg.norm(q_vec)
+                        if n_norm > 1e-10 and q_norm > 1e-10:
+                            sim = float(n_emb @ q_vec / (n_norm * q_norm))
+                            cleaned = _clean_chunk(n_fact.get('full_key', ''))
+                            if cleaned and sim >= 0.5:
+                                seen_ids.add(nid)
+                                results.append({
+                                    'similarity': sim,
+                                    'content': cleaned,
+                                    'type': 'fact',
+                                    'project': 'hermes-memory',
+                                    'expanded': True,
+                                })
+            
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            results = results[:top_k_per_project]
+            
+            logger.debug("SQLite search: %.1fms | n=%d | '%s'",
+                        (time.perf_counter() - _t_start) * 1000, len(results), query[:40])
+            return results
+            
+        except Exception as e:
+            logger.error("SQLite search error: %s", e)
+            return []
     
     def _rerank_rrf(self, graph_results, fts5_results, k=60, graph_weight=1.5, fts5_weight=1.0):
         """إعادة ترتيب النتائج باستخدام Reciprocal Rank Fusion (RRF)
@@ -836,12 +789,9 @@ class UnifiedMemoryProvider(MemoryProvider):
             return {"error": str(e)}
     
     def _tool_graph_search(self, args):
-        graphify = self._get_graphify()
-        if not graphify:
-            return {"error": "Graphify not initialized"}
-        
+        """P4: SQLite-based graph search (replaces NetworkX)."""
         query = args.get("query", "")
-        project = args.get("project", "")
+        project = args.get("project", "hermes-memory")  # Default to main project
         top_k = args.get("top_k", 10)
         
         # فلتر: استعلام فارغ أو غير صالح
@@ -852,43 +802,85 @@ class UnifiedMemoryProvider(MemoryProvider):
         if not has_word:
             return {"query": query, "project": project, "results": [], "total": 0}
         
-        if not project:
-            return {"error": "Project name is required"}
-        
         try:
-            graph = self._graph_cache.get(project, graphify.storage.load)
-            if graph is None:
-                return {"error": "Project not found: %s" % project}
-
+            # P4: Use SQLite-based vector search (not NetworkX graph)
+            db = _get_memory_db()
+            if db is None:
+                # Fallback to legacy graphify for backward compat
+                graphify = self._get_graphify()
+                if graphify:
+                    # Load graph the old way
+                    if project and project != "hermes-memory":
+                        from pathlib import Path
+                        graph = self._graph_cache.get(project, graphify.storage.load)
+                        if graph:
+                            query_embedding = graphify.embedding.embed_query(query)
+                            results = []
+                            for node_id in graph.nodes():
+                                node_embedding = graph.nodes[node_id].get("embedding")
+                                if node_embedding is None:
+                                    continue
+                                v1 = np.array(query_embedding); v2 = np.array(node_embedding)
+                                v1_norm = np.linalg.norm(v1); v2_norm = np.linalg.norm(v2)
+                                if v1_norm < 1e-10 or v2_norm < 1e-10:
+                                    continue
+                                similarity = float(np.dot(v1, v2) / (v1_norm * v2_norm))
+                                if similarity >= 0.5:
+                                    results.append({"similarity": similarity, "content": _clean_chunk(graph.nodes[node_id].get("content", "")), "type": graph.nodes[node_id].get("type", "unknown")})
+                            results.sort(key=lambda x: x["similarity"], reverse=True)
+                            return {"query": query, "project": project, "results": results[:top_k], "total": len(results), "backend": "networkx-fallback"}
+                    return {"error": "No project specified for legacy search"}
+                return {"error": "Memory DB not available and Graphify not initialized"}
+            
+            # Get embedding from graphify (BGE-M3 cache)
+            graphify = self._get_graphify()
+            if not graphify:
+                return {"error": "Graphify not initialized"}
+                
             query_embedding = graphify.embedding.embed_query(query)
-            results = []
             
-            for node_id in graph.nodes():
-                node_embedding = graph.nodes[node_id].get("embedding")
-                if node_embedding is None:
-                    continue
-                
-                v1 = np.array(query_embedding)
-                v2 = np.array(node_embedding)
-                v1_norm = np.linalg.norm(v1)
-                v2_norm = np.linalg.norm(v2)
-                if v1_norm < 1e-10 or v2_norm < 1e-10:
-                    continue
-                similarity = float(np.dot(v1, v2) / (v1_norm * v2_norm))
-                
-                if similarity >= 0.5:  # GRAPH_SEARCH_MIN_SIMILARITY
-                    content = _clean_chunk(graph.nodes[node_id].get("content", ""))
-                    if content:
-                        results.append({
-                            "similarity": similarity,
-                            "content": content,
-                            "type": graph.nodes[node_id].get("type", "unknown"),
-                        })
+            # Search SQLite via MemoryDB
+            results = db.search_similar(query_embedding, top_k=top_k, threshold=0.5)
             
-            results.sort(key=lambda x: x["similarity"], reverse=True)
+            # Also do FTS5 text search for complementary results
+            text_results = db.search_text(query, limit=3)
             
-            return {"query": query, "project": project, "results": results[:top_k]}
+            # Combine and deduplicate
+            seen_ids = set()
+            combined = []
+            
+            for r in results:
+                if r['id'] not in seen_ids:
+                    seen_ids.add(r['id'])
+                    combined.append({
+                        "similarity": r["similarity"],
+                        "content": _clean_chunk(r["key"]),
+                        "type": "fact",
+                        "category": r["category"],
+                        "source": "vector",
+                    })
+            
+            for r in text_results:
+                if r['id'] not in seen_ids:
+                    seen_ids.add(r['id'])
+                    combined.append({
+                        "similarity": 0.6,  # Text matches get moderate sim
+                        "content": _clean_chunk(r["key"]),
+                        "type": "fact",
+                        "category": r["category"],
+                        "source": "fts5",
+                    })
+            
+            combined.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            return {
+                "query": query, "project": project,
+                "results": combined[:top_k],
+                "total": len(combined),
+                "backend": "sqlite"
+            }
         except Exception as e:
+            logger.error("graph_search error: %s", e)
             return {"error": str(e)}
     
     def shutdown(self):
