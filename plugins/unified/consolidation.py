@@ -170,9 +170,10 @@ class MemoryConsolidator:
 
     def _group_similar_facts(self, facts: List[Dict]) -> List[List[Dict]]:
         """Group facts by cosine similarity threshold.
-        
-        Uses existing embeddings from MemoryDB to find similar facts.
-        Returns list of groups, each group is a list of similar facts.
+
+        P5-fix: Single query with IN clause instead of N+1 queries.
+        Compares only candidate facts against each other (not full DB).
+        Preserves full fact dict (id, key, category, created_at).
         """
         if not facts:
             return []
@@ -186,58 +187,72 @@ class MemoryConsolidator:
             return []
 
         threshold = self.config.get('similarity_threshold', 0.85)
-        groups = []
-        used_ids = set()
 
         try:
             import numpy as np
 
-            for fact in facts:
-                if fact['id'] in used_ids:
-                    continue
+            # Single query: fetch embeddings for all candidate facts at once
+            fact_ids = [f['id'] for f in facts]
+            placeholders = ','.join(['?' for _ in fact_ids])
+            cursor = conn.execute(
+                f"SELECT id, key, category, created_at, embedding "
+                f"FROM facts WHERE id IN ({placeholders}) AND embedding IS NOT NULL",
+                fact_ids
+            )
+            rows = cursor.fetchall()
 
-                cursor = conn.execute(
-                    "SELECT embedding FROM facts WHERE id = ?",
-                    [fact['id']]
+            # Build lookup: id -> (full_fact_dict, embedding_vec)
+            id_to_data = {}
+            for row_id, row_key, row_cat, row_created, row_emb in rows:
+                vec = np.asarray(json.loads(row_emb), dtype=np.float32)
+                id_to_data[row_id] = (
+                    {
+                        'id': row_id,
+                        'key': row_key,
+                        'category': row_cat,
+                        'created_at': row_created,
+                    },
+                    vec,
                 )
-                row = cursor.fetchone()
-                if not row or not row[0]:
-                    used_ids.add(fact['id'])
+
+            if not id_to_data:
+                return []
+
+            # In-memory pairwise comparison
+            groups = []
+            used_ids = set()
+            ids = list(id_to_data.keys())
+
+            for i, fact_id in enumerate(ids):
+                if fact_id in used_ids:
                     continue
 
-                q_vec = np.asarray(json.loads(row[0]), dtype=np.float32)
+                full_fact, q_vec = id_to_data[fact_id]
                 q_norm = np.linalg.norm(q_vec)
+                if q_norm < 1e-10:
+                    used_ids.add(fact_id)
+                    continue
 
-                cursor = conn.execute(
-                    "SELECT id, key, embedding FROM facts WHERE embedding IS NOT NULL"
-                )
-                all_with_embeddings = cursor.fetchall()
-
-                similar = [fact]
-                for other_id, other_key, other_emb in all_with_embeddings:
-                    if other_id in used_ids or other_id == fact['id']:
+                similar = [full_fact]
+                for other_id in ids[i + 1:]:
+                    if other_id in used_ids:
                         continue
-
-                    other_vec = np.asarray(json.loads(other_emb), dtype=np.float32)
+                    other_fact, other_vec = id_to_data[other_id]
                     other_norm = np.linalg.norm(other_vec)
-
-                    if q_norm < 1e-10 or other_norm < 1e-10:
+                    if other_norm < 1e-10:
                         continue
 
                     sim = float(q_vec @ other_vec / (q_norm * other_norm))
                     if sim >= threshold:
                         similar.append({
-                            'id': other_id,
-                            'key': other_key,
+                            **other_fact,
                             'similarity': sim,
                         })
                         used_ids.add(other_id)
 
                 if len(similar) >= 2:
                     groups.append(similar)
-                    used_ids.update(f['id'] for f in similar)
-                else:
-                    used_ids.add(fact['id'])
+                    used_ids.add(fact_id)
 
             return groups
         except Exception as e:
@@ -311,7 +326,11 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
             conn.close()
 
     def _delete_compressed_facts(self, group: List[Dict]) -> bool:
-        """Delete original facts after archiving."""
+        """Delete original facts after archiving.
+
+        P5-fix: Wrapped in explicit BEGIN IMMEDIATE transaction.
+        Rolls back on failure to prevent partial data loss.
+        """
         db = self._get_db()
         if db is None:
             return False
@@ -320,13 +339,21 @@ Output ONLY the compressed summary, nothing else. Keep it under 200 characters."
         if conn is None:
             return False
 
+        ids = [f['id'] for f in group]
+        placeholders = ','.join(['?' for _ in ids])
+
         try:
-            ids = [f['id'] for f in group]
-            placeholders = ','.join(['?' for _ in ids])
-            conn.execute(f"DELETE FROM facts WHERE id IN ({placeholders})", ids)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"DELETE FROM facts WHERE id IN ({placeholders})", ids
+            )
             conn.commit()
             return True
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.error("Failed to delete compressed facts: %s", e)
             return False
 

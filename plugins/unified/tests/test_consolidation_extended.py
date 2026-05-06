@@ -470,7 +470,8 @@ class TestDeleteCompressedFacts:
             result = consolidator._delete_compressed_facts(group)
 
         assert result is True
-        mock_conn.execute.assert_called_once()
+        assert mock_conn.execute.call_count == 2  # BEGIN IMMEDIATE + DELETE
+        mock_conn.execute.assert_any_call("BEGIN IMMEDIATE")
         mock_conn.commit.assert_called_once()
 
     def test_delete_db_none(self):

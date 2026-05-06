@@ -38,7 +38,7 @@ import numpy as np
 # P0: Moved to separate modules
 from unified.utils import _format_age, _clean_chunk
 from unified.cache import QueryResultCache, GraphCache
-from unified.memory_db import _get_memory_db, _GLOBAL_MODEL_CACHE
+from unified.memory_db import _get_memory_db
 
 # P1b: Auto consolidation (optional — import on demand)
 # from unified.consolidation import MemoryConsolidator

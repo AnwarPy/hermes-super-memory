@@ -6,9 +6,6 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-# Global singleton — مشاركة النموذج عالمياً لتجنب إعادة التحميل
-_GLOBAL_MODEL_CACHE = {}
-
 # P4: MemoryDB SQLite reference (lazy init — only when needed)
 _memory_db = None
 
