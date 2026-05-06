@@ -519,6 +519,14 @@ def main():
         if sid not in tracker["summarized_sessions"]:
             tracker["summarized_sessions"].append(sid)
             save_tracker(tracker)
+        
+        # P5: Also mark in SQLite for unified session tracking
+        try:
+            from db import get_db
+            db = get_db()
+            db.mark_session_summarized(sid)
+        except Exception:
+            pass  # JSONL tracker is source of truth
 
     if summarized_count:
         print(f"\n✓ Summarized {summarized_count} sessions, {total_facts} facts total")

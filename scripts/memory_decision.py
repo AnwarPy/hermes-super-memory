@@ -299,8 +299,20 @@ def process_fact(candidate_fact: dict) -> dict:
         result['action'] = 'SKIPPED (already exists)'
     
     elif decision == 'update':
+        if target_id:
+            db = _get_db()
+            try:
+                db._get_conn().execute(
+                    "UPDATE facts SET importance = MAX(importance, ?), seen_count = seen_count + 1, last_seen_at = ? WHERE id = ?",
+                    (candidate_fact.get('importance', 1), __import__('time').time(), target_id)
+                )
+                db._get_conn().commit()
+                result['action'] = 'UPDATED existing'
+            except Exception as e:
+                result['action'] = f'UPDATE_ERROR: {e}'
+        else:
+            result['action'] = 'UPDATE_SKIPPED (no target)'
         result['fact_id'] = target_id
-        result['action'] = 'UPDATED existing'
     
     elif decision == 'contradict':
         if target_id:

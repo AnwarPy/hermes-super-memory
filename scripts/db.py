@@ -191,12 +191,16 @@ class MemoryDB:
         aliases: Optional[List[str]] = None,
     ) -> int:
         """
-        Insert or update a fact. Returns fact id.
+        Insert or update a fact atomically. Returns fact id.
 
         Strategy:
         1. Compute fact_hash from normalized key (caller must normalize first)
-        2. Find existing live fact with same hash → UPDATE
-        3. Otherwise → INSERT new
+        2. Find existing live fact with same hash → UPDATE + FTS5 refresh
+        3. Otherwise → INSERT new + FTS5 insert
+
+        P4: Wrapped in explicit BEGIN/COMMIT/ROLLBACK — UPDATE/INSERT
+        and FTS5 operations are atomic. WAL mode ensures readers see
+        only committed state.
 
         Uses unixepoch('subsec') for sub-millisecond precision.
         """
@@ -206,64 +210,77 @@ class MemoryDB:
         emb_blob = pack_embedding(embedding) if embedding else None
         aliases_json = json.dumps(aliases or [], ensure_ascii=False)
 
-        # Try update existing live fact
-        cur = conn.execute(
-            """UPDATE facts 
-               SET importance = MAX(importance, ?),
-                   seen_count = seen_count + 1,
-                   last_seen_at = ?,
-                   aliases = CASE 
-                       WHEN aliases IS NULL THEN ? 
-                       ELSE aliases 
-                   END,
-                   embedding = COALESCE(?, embedding)
-               WHERE fact_hash = ? AND valid_to IS NULL
-               RETURNING id""",
-            (importance, now, aliases_json, emb_blob, fact_hash)
-        )
-        row = cur.fetchone()
-
-        if row:
-            fact_id = row[0]
-            # Update FTS5
-            conn.execute(
-                "UPDATE facts_fts SET full_key = ?, content = ? WHERE rowid = ?",
-                (key, f"{category} {aliases_json}", fact_id)
-            )
-        else:
-            # Insert new
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Try update existing live fact
             cur = conn.execute(
-                """INSERT INTO facts (fact_hash, full_key, category, importance, 
-                                      valid_from, session_id, source, aliases, 
-                                      embedding, created_at, last_seen_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """UPDATE facts 
+                   SET importance = MAX(importance, ?),
+                       seen_count = seen_count + 1,
+                       last_seen_at = ?,
+                       aliases = CASE 
+                           WHEN aliases IS NULL THEN ? 
+                           ELSE aliases 
+                       END,
+                       embedding = COALESCE(?, embedding)
+                   WHERE fact_hash = ? AND valid_to IS NULL
                    RETURNING id""",
-                (fact_hash, key, category, importance,
-                 now, session_id, source, aliases_json,
-                 emb_blob, now, now)
+                (importance, now, aliases_json, emb_blob, fact_hash)
             )
-            fact_id = cur.fetchone()[0]
+            row = cur.fetchone()
 
-            # Insert into FTS5
-            conn.execute(
-                "INSERT INTO facts_fts (rowid, full_key, content) VALUES (?, ?, ?)",
-                (fact_id, key, f"{category} {aliases_json}")
-            )
+            if row:
+                fact_id = row[0]
+                # Update FTS5
+                conn.execute(
+                    "UPDATE facts_fts SET full_key = ?, content = ? WHERE rowid = ?",
+                    (key, f"{category} {aliases_json}", fact_id)
+                )
+            else:
+                # Insert new
+                cur = conn.execute(
+                    """INSERT INTO facts (fact_hash, full_key, category, importance, 
+                                          valid_from, session_id, source, aliases, 
+                                          embedding, created_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       RETURNING id""",
+                    (fact_hash, key, category, importance,
+                     now, session_id, source, aliases_json,
+                     emb_blob, now, now)
+                )
+                fact_id = cur.fetchone()[0]
 
-        conn.commit()
-        return fact_id
+                # Insert into FTS5
+                conn.execute(
+                    "INSERT INTO facts_fts (rowid, full_key, content) VALUES (?, ?, ?)",
+                    (fact_id, key, f"{category} {aliases_json}")
+                )
+
+            conn.execute("COMMIT")
+            return fact_id
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def invalidate_fact(self, fact_id: int, superseded_by: Optional[int] = None):
-        """Mark a fact as no longer valid (soft delete, bi-temporal)."""
+        """Mark a fact as no longer valid (soft delete, bi-temporal).
+        
+        P5: Atomic UPDATE + FTS5 DELETE wrapped in transaction.
+        """
         conn = self._get_conn()
         now = time.time()
-        conn.execute(
-            "UPDATE facts SET valid_to = ?, superseded_by = ? WHERE id = ?",
-            (now, superseded_by, fact_id)
-        )
-        # Remove from FTS5
-        conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (fact_id,))
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE facts SET valid_to = ?, superseded_by = ? WHERE id = ?",
+                (now, superseded_by, fact_id)
+            )
+            # Remove from FTS5
+            conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (fact_id,))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         self.log_event("fact_invalidated", f"id={fact_id} superseded_by={superseded_by}")
 
     def get_fact(self, fact_id: int) -> Optional[Dict]:
@@ -526,13 +543,22 @@ class MemoryDB:
             'db_size_mb': round(db_size / (1024 * 1024), 2),
         }
 
-    def vacuum(self):
-        """Reclaim space and optimize database."""
+    def vacuum(self, full_vacuum: bool = False):
+        """Reclaim space and optimize database.
+        
+        P5: Actually runs VACUUM when full_vacuum=True (weekly cron).
+        Default is PRAGMA optimize only (fast, non-blocking, daily).
+        """
         conn = self._get_conn()
         conn.execute("PRAGMA optimize")
         conn.execute("PRAGMA analysis_limit=1000")
         conn.execute("PRAGMA optimize")
-        self.log_event("vacuum", "Database optimized")
+        
+        if full_vacuum:
+            conn.execute("VACUUM")
+            self.log_event("vacuum", "Full VACUUM executed")
+        else:
+            self.log_event("vacuum", "PRAGMA optimize (fast)")
 
     # ============================================================
     # Helpers

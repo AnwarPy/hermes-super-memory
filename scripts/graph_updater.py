@@ -83,8 +83,8 @@ def read_new_facts(db: MemoryDB):
     يقرأ الحقائق الجديدة من JSONL.
     يتتبع الحقائق المُفهرسة عبر db.processing_state بدلاً من graph_tracker.json.
     """
-    # Load tracked hashes from SQLite (migrated from tracker)
-    tracker_json = db.get_state('tracker_hashes') or '[]'
+    # P5: Unified tracker key (matches migrate_v1.py)
+    tracker_json = db.get_state('graph_tracker_hashes') or '[]'
     indexed_hashes = set(json.loads(tracker_json))
 
     new_facts = []
@@ -350,7 +350,16 @@ def add_facts_to_db(db: MemoryDB, facts: list):
                                         decision_made = True
                                         print(f"    UPDATE: {key[:60]}... ({reason[:80]})")
                                     elif decision == "contradict":
-                                        db.invalidate_fact(target, superseded_by=None)  # New ID not yet available
+                                        # P5: Insert new fact first, then invalidate old with superseded_by=new_id
+                                        new_id = db.upsert_fact(
+                                            key=key, category=category, embedding=embedding,
+                                            session_id=session_id, source='graph_updater',
+                                            importance=importance
+                                        )
+                                        db.invalidate_fact(target, superseded_by=new_id)
+                                        nodes_added += 1
+                                        new_fact_ids.append(new_id)
+                                        decision_made = True
                                         print(f"    CONTRADICT: {key[:60]}... ({reason[:80]})")
                 except Exception as e:
                     print(f"    ⚠ Decision engine error: {e}")
@@ -463,8 +472,8 @@ def main():
         orphan_count, orphan_hashes = remove_orphan_nodes(db)
         if orphan_hashes:
             current = indexed_hashes - orphan_hashes
-            db.set_state('tracker_hashes', json.dumps(list(current)))
-            db.set_state('tracker_count', str(len(current)))
+            db.set_state('graph_tracker_hashes', json.dumps(list(current)))
+            db.set_state('graph_tracker_count', str(len(current)))
         if orphan_count:
             print(f"  Orphans cleaned: {orphan_count} facts")
         db.log_event("run_complete", "No new facts")
@@ -494,9 +503,9 @@ def main():
     if orphan_hashes:
         indexed_hashes -= orphan_hashes
 
-    # Persist tracker state to SQLite
-    db.set_state('tracker_hashes', json.dumps(list(indexed_hashes)))
-    db.set_state('tracker_count', str(len(indexed_hashes)))
+    # Persist tracker state to SQLite (P5: unified key)
+    db.set_state('graph_tracker_hashes', json.dumps(list(indexed_hashes)))
+    db.set_state('graph_tracker_count', str(len(indexed_hashes)))
     db.set_state('last_run', datetime.now(timezone.utc).isoformat())
 
     # Final stats
