@@ -234,11 +234,14 @@ class UnifiedMemoryProvider(MemoryProvider):
             "Use unified_search for all memory layers.\n"
         )
     
-    def _search_graph_cached(self, query, top_k_per_project=2, max_age_cutoff=None, session_id=""):
+    def _search_graph_cached(self, query, top_k_per_project=2, max_age_cutoff=None, session_id="", relation_type=None):
         """بحث دلالي SQLite-native — P6 final.
         
         Reads directly from MemoryDB (hermes_memory.db).
         No NetworkX, no graph.json, no GraphCache needed.
+        
+        P3: relation_type parameter filters neighbor expansion by typed relations.
+        If None, uses existing 'similar' kind (backward compatible).
         """
         import time
         _t_start = time.perf_counter()
@@ -296,11 +299,12 @@ class UnifiedMemoryProvider(MemoryProvider):
                         'expanded': False,
                     })
             
-            # 1-hop neighbor expansion via fact_relations
+            # P3: 1-hop neighbor expansion via fact_relations (supports typed relations)
             if results and len(sqlite_results) >= 2:
                 neighbor_ids = set()
+                relation_kind = relation_type or 'similar'  # P3: typed or default
                 for r in sqlite_results[:2]:
-                    nbrs = db.get_neighbors(r['id'], kind='similar')
+                    nbrs = db.get_neighbors(r['id'], kind=relation_kind)
                     for n in nbrs[:2]:
                         if n['id'] not in seen_ids:
                             neighbor_ids.add(n['id'])
@@ -624,6 +628,11 @@ class UnifiedMemoryProvider(MemoryProvider):
                         "query": {"type": "string", "description": "نص البحث"},
                         "project": {"type": "string", "description": "اسم المشروع"},
                         "top_k": {"type": "integer", "default": 10},
+                        "relation_type": {
+                            "type": "string",
+                            "description": "P3: فلترة بنوع العلاقة (causes, fixes, supports, contradicts, related)",
+                            "enum": ["causes", "fixes", "supports", "contradicts", "related"],
+                        },
                     },
                     "required": ["query", "project"],
                 },
@@ -720,10 +729,14 @@ class UnifiedMemoryProvider(MemoryProvider):
             return {"error": str(e)}
     
     def _tool_graph_search(self, args):
-        """P4: SQLite-based graph search (replaces NetworkX)."""
+        """P4: SQLite-based graph search (replaces NetworkX).
+        
+        P3: Added relation_type parameter to filter results by typed relations.
+        """
         query = args.get("query", "")
         project = args.get("project", "hermes-memory")  # Default to main project
         top_k = args.get("top_k", 10)
+        relation_type = args.get("relation_type")  # P3: optional filter
         
         # فلتر: استعلام فارغ أو غير صالح
         if not query or len(query.strip()) < 2:
@@ -801,6 +814,26 @@ class UnifiedMemoryProvider(MemoryProvider):
                         "category": r["category"],
                         "source": "fts5",
                     })
+            
+            # P3: 1-hop neighbor expansion with typed relations
+            if combined:
+                relation_kind = relation_type or 'similar'
+                for r in combined[:3]:
+                    fact_id = r.get('id')
+                    if fact_id:
+                        nbrs = db.get_neighbors(fact_id, kind=relation_kind)
+                        for n in nbrs[:2]:
+                            if n['id'] not in seen_ids:
+                                seen_ids.add(n['id'])
+                                n_fact = db.get_fact(n['id'])
+                                if n_fact:
+                                    combined.append({
+                                        "similarity": n.get('weight', 0.5),
+                                        "content": _clean_chunk(n_fact.get('full_key', '')),
+                                        "type": "fact",
+                                        "category": n_fact.get("category", "unknown"),
+                                        "source": f"relation:{relation_kind}",
+                                    })
             
             combined.sort(key=lambda x: x["similarity"], reverse=True)
             
