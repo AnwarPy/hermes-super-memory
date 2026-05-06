@@ -1,10 +1,10 @@
 {
-  "first_search_ms": 67.93665885925293,
-  "warm_search_avg_ms": 77.56209373474121,
-  "warm_search_p95_ms": 89.75863456726074,
-  "fts5_arabic_avg_ms": 0.12722015380859375,
-  "fts5_arabic_max_ms": 0.3952980041503906,
-  "timestamp": 1778073521.3439682,
+  "first_search_ms": 72.64113426208496,
+  "warm_search_avg_ms": 68.86734962463379,
+  "warm_search_p95_ms": 74.8295783996582,
+  "fts5_arabic_avg_ms": 0.12426376342773438,
+  "fts5_arabic_max_ms": 0.4010200500488281,
+  "timestamp": 1778097245.518695,
   "test_count": {
     "arabic_queries": 10,
     "english_queries": 10,

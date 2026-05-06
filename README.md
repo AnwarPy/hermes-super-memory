@@ -6,6 +6,9 @@
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![Arabic RTL](https://img.shields.io/badge/Language-Arabic%20%7C%20English-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-477%20passing-brightgreen.svg)]()
+[![Coverage](https://img.shields.io/badge/Coverage-87%25-brightgreen.svg)]()
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue.svg)](.github/workflows/test.yml)
 
 ---
 
@@ -29,6 +32,10 @@
 | 🧵 **Thread-safe** — Producer/consumer pattern with `threading.Event` synchronization | 🧵 **آمن متعدد الخيوط** — نمط المنتج/المستهلك مع مزامنة Event |
 | 📦 **Production-hardened** — 100% recall, edge-case handling, query caching (TTL 5m) | 📦 **جاهز للإنتاج** — recall 100%، معالجة حالات الحافة، كاش استعلامات |
 | 🏷️ **Source labels** — Clear provenance: `[graph:project]` / `[session:2h ago]` | 🏷️ **ملصقات المصدر** — مصدر واضح: `[graph:مشروع]` / `[session:منذ 2س]` |
+| 📝 **Mistake Notes** — Track, classify, and learn from past errors | 📝 **ملاحظات الأخطاء** — تتبع وتصنيف والتعلم من الأخطاء السابقة |
+| 🔀 **Typed Relations** — LLM-classified edges: causes, fixes, supports, contradicts | 🔀 **علاقات مُصنّفة** — حواف مصنّفة بـ LLM: يسبب، يحل، يدعم، يناقض |
+| 🏗️ **Memory Consolidation** — Auto-compress similar facts with archive + dry-run | 🏗️ **ضغط الذاكرة** — ضغط تلقائي للحقائق المتشابهة مع أرشيف + dry-run |
+| 🧑‍🤝‍🧑 **Agent ID (Swarm)** — Attribute and filter memories by agent in multi-agent setups | 🧑‍🤝‍🧑 **معرف الوكيل** — وسم وتصفية الذكريات حسب الوكيل في البيئات المتعددة |
 
 ---
 
@@ -76,7 +83,7 @@ hermes-super-memory/
 ├── README.md                     # This file / هذا الملف
 │
 ├── plugins/unified/              # Core plugin / القلب الرئيسي
-│   ├── __init__.py               # UnifiedMemoryProvider — prefetch, RRF, tools
+│   ├── __init__.py               # UnifiedMemoryProvider — prefetch, RRF, tools (886 lines)
 │   ├── embedding_model.py        # BGE-M3 singleton on CUDA/CPU
 │   ├── graph_engine.py           # GraphifyEngine — indexing + search
 │   ├── graph_builder.py          # Builds knowledge graphs with Arabic normalization
@@ -85,14 +92,34 @@ hermes-super-memory/
 │   ├── document_loader.py        # File/document loader with filters
 │   ├── text_splitter.py          # Arabic-aware text chunking (512/96)
 │   ├── arabic_normalizer.py      # Comprehensive Arabic text normalization
+│   ├── memory_db.py              # MemoryDB SQLite interface
+│   ├── cache.py                  # QueryResultCache + GraphCache
+│   ├── utils.py                  # Shared utilities (_clean_chunk, _format_age)
+│   ├── agent_id.py               # AgentIdMixin for swarm environments
+│   ├── consolidation.py          # Decay + compression + archive + pinning + dry-run
+│   ├── mistake_notes.py          # Mistake tracking with 3-tier Arabic FTS5 search
+│   ├── relations.py              # LLM-based typed relation classifier
 │   ├── plugin.yaml               # Plugin configuration / إعدادات الإضافة
-│   └── tests/                    # 179 tests / 179 اختبار
-│       ├── test_arabic_normalizer.py    # 43 tests — Arabic normalization
-│       ├── test_document_loader.py      # 34 tests — Document loading
-│       ├── test_unified_memory.py       # 33 tests — Unified search
-│       ├── test_graph_builder.py        # 29 tests — Graph building
-│       ├── test_graph_storage.py        # 25 tests — Graph storage
-│       └── test_community_detector.py   # 15 tests — Community detection
+│   └── tests/                    # 477 tests / 477 اختبار
+│       ├── test_integration.py          # 6 integration tests (regression guards)
+│       ├── test_mistake_notes.py        # Mistake tracking & 3-tier search
+│       ├── test_consolidation.py        # Compression pipeline
+│       ├── test_consolidation_extended.py # Archive, dry-run, safety
+│       ├── test_relations.py            # Relation classifier
+│       ├── test_relations_extended.py   # N+1 fix, batch queries
+│       ├── test_agent_id.py             # Swarm attribution
+│       ├── test_arabic_normalizer.py    # Arabic normalization
+│       ├── test_cache_extended.py       # Query caching + TTL
+│       ├── test_community_detector.py   # Community detection
+│       ├── test_consolidation.py        # Compression pipeline
+│       ├── test_decay.py                # Time-based score decay
+│       ├── test_document_loader.py      # Document loading
+│       ├── test_embedding_model.py      # Model device selection
+│       ├── test_graph_builder.py        # Graph building
+│       ├── test_graph_storage.py        # Graph storage
+│       ├── test_unified_memory.py       # Unified search pipeline
+│       ├── test_utils.py                # Utility functions
+│       └── baseline/                    # Performance baselines
 │
 └── scripts/                      # Cron scripts / سكربتات الجدولة
     ├── session_summarizer.py     # Auto-summarize sessions / تلخيص تلقائي
@@ -268,21 +295,47 @@ export OLLAMA_URL=http://localhost:11434/api/chat
 ## 🧪 Testing / الاختبارات
 
 ```bash
-cd ~/.hermes/plugins
-python3 -m pytest unified/tests/ -v
-# Expected: 179 passed, 0 failed
+cd ~/.hermes/plugins/unified
+python3 -m pytest tests/ -v
+# Expected: 477 passed, 0 failed
 ```
 
 ### Coverage / التغطية
 
-| Test File | Tests | Focus |
-|-----------|-------|-------|
-| `test_arabic_normalizer.py` | 43 | Arabic text normalization |
-| `test_document_loader.py` | 34 | File loading with filters |
-| `test_unified_memory.py` | 33 | Unified search pipeline |
-| `test_graph_builder.py` | 29 | Graph construction |
-| `test_graph_storage.py` | 25 | Compact JSON storage |
-| `test_community_detector.py` | 15 | Community detection |
+**Overall: 87%** across all modules.
+
+| Module | Coverage | Tests |
+|--------|----------|-------|
+| `agent_id.py` | 100% | 150 |
+| `arabic_normalizer.py` | 98% | 116 |
+| `cache.py` | 97% | 270 |
+| `consolidation.py` | 94% | 597 |
+| `mistake_notes.py` | 83% | 466 |
+| `relations.py` | 88% | 299 |
+| `utils.py` | 100% | 76 |
+| `test_integration.py` | — | 6 (regression guards) |
+
+### CI / الاستمراري
+
+Every push and pull request triggers **GitHub Actions** automatically:
+- Runs all 477 tests on Ubuntu with Python 3.11
+- Enforces **80% minimum coverage** threshold
+- Fails the build if any test breaks
+
+No GPU required in CI — heavy model tests use mocking. Total CI time: ~3 minutes.
+
+### Running locally / تشغيل محلي
+
+```bash
+# Quick check / فحص سريع
+pytest tests/ -q
+
+# With coverage / مع التغطية
+pytest tests/ --cov=unified --cov-report=term-missing
+
+# Only integration tests / اختبارات التكامل فقط
+pytest tests/test_integration.py -v
+```
 
 ---
 
@@ -301,9 +354,31 @@ python3 ~/.hermes/scripts/graph_updater.py
 > **Why?** Old nodes are stored without Arabic normalization in embeddings, so cosine similarity fails when searching with normalized text.  
 > **لماذا؟** العقد القديمة مخزنة بدون تطبيع عربي في التضمينات، فـ cosine similarity يفشل عند البحث بالنص المطبّع.
 
----
+## 🛡️ Safety Features / ميزات الأمان
 
-## ❓ Troubleshooting / استكشاف الأخطاء
+| Feature | Description |
+|---------|-------------|
+| **`dry_run: true` (default)** | Compression previews changes without applying them |
+| **`BEGIN IMMEDIATE` transactions** | All delete operations wrapped in explicit transactions with rollback on failure |
+| **Archive before delete** | Original facts are archived before compression — full audit trail |
+| **Protected categories** | `preference` and `identity` facts can never be compressed |
+| **Connection safety** | Shared DB connections tracked with `(conn, is_shared)` tuple — prevents accidental close |
+| **Sampling for large datasets** | O(n²) grouping capped at 5,000 facts with deterministic seed |
+| **Generic error responses** | Tool errors return `"Internal error occurred"` — no path/stack trace leaks |
+
+## 🔍 Three-Tier Arabic Search / البحث العربي ثلاثي الطبقات
+
+```
+1. FTS5 (unicode61)  →  Fast exact word matches   —  "مشكلة" finds "مشكلة"
+        ↓ no results?
+2. FTS5 (trigram)    →  Substring matching         —  "ذاكرة" finds "الذاكرة"
+        ↓ no results?
+3. LIKE fallback     →  Broad pattern matching     —  catches edge cases
+```
+
+Plus **query normalization**: hamza unification (أ/إ/آ → ا), Persian chars (ک→ك, ی→ي), diacritics removal — all applied automatically.
+
+---
 
 ### BGE-M3 fails to load / فشل تحميل BGE-M3
 ```bash
@@ -340,13 +415,20 @@ tail -f ~/.hermes/logs/agent.log | grep "preload"
 
 | Metric | Value |
 |--------|-------|
-| **Tests** | 179 passed, 0 failures, ~6s |
-| **hermes-memory graph** | 864 nodes, 8,058 edges |
+| **Tests** | 477 passed, 0 failures, ~52s |
+| **Coverage** | 87% overall |
+| **CI** | GitHub Actions, ~3 min per push/PR |
+| **Facts** | 593 (556 with embeddings) |
+| **Relations** | 2,959 |
+| **Sessions summarized** | 196 |
+| **hermes_memory.db** | 2.9 MB |
 | **Embeddings** | BGE-M3, 1024-dim, FP16 on CUDA |
-| **Search recall** | 100% vs FTS5 baseline |
+| **First search** | ~68ms (background preload) |
+| **Warm search** | ~78ms avg |
+| **FTS5 Arabic** | 0.13ms avg |
 | **Query cache** | TTL 5m, MAX_SIZE 500 |
-| **Indexed projects** | 12+ (hermes-memory, multica, wikillm-*) |
-| **Fact categories** | 9 (technical, preference, project, config...) |
+| **Fact categories** | 10 (technical, service, general, fact, project, correction, preference, personal, decision, test) |
+| **Mistake categories** | 10 (syntax, logic, config, api, security, performance, data, deployment, communication, other) |
 
 ---
 
