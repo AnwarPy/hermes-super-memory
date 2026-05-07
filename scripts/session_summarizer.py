@@ -251,11 +251,43 @@ def generate_summary(session_id, messages):
         "Respond in English only."
     )
 
+    # P5: Few-shot examples + structured importance rules for 7B model
+    FEW_SHOT_EXAMPLES = (
+        "EXAMPLE 1 — GOOD output:\n"
+        '{"summary": ['
+        '"Fixed elif→if bug in graph_builder.py line 142 that caused O(n²) edge creation",'
+        '"Added SIMILAR_EDGE_THRESHOLD=0.82 constant to replace hardcoded 0.70 value",'
+        '"Integrated Leiden community detection — detected 70 communities from 738 nodes"'
+        '], "facts": ['
+        '{"key": "Similar edge threshold is 0.82, defined as SIMILAR_EDGE_THRESHOLD constant", "category": "technical"},'
+        '{"key": "Leiden community detection runs after every graph save in save_graph()", "category": "technical"},'
+        '{"key": "User prefers concise Arabic responses with technical terminology", "category": "preference"}'
+        '], "language": "en", "importance": 4}\n\n'
+
+        "EXAMPLE 2 — BAD output (DO NOT DO THIS):\n"
+        '{"summary": ["Sessions summarized: 5", "The system was built"], '
+        '"facts": [{"key": "Number of nodes is 941", "category": "technical"}, '
+        '{"key": "Total communities: 0", "category": "technical"}], '
+        '"language": "en", "importance": 3}\n'
+        "Why this is bad: generic bullets, snapshot stats instead of lasting facts.\n\n"
+
+        "IMPORTANCE RULES (use these, do not guess):\n"
+        "- 5: Security fixes, API key changes, data loss bugs, breaking changes\n"
+        "- 4: User preferences, project decisions, config changes, bug fixes with root cause\n"
+        "- 3: Technical implementations, new features, file modifications, deployments\n"
+        "- 2: Routine tasks, code reviews, discussions without concrete outcomes\n"
+        "- 1: Test messages, acknowledgments, greetings, idle sessions\n"
+    )
+
     prompt = (
         f"You are an expert session summarizer and fact extractor. {lang_instruction}\n\n"
+
         "TASK 1 — Summary (3-5 bullets):\n"
-        "- Write SPECIFIC, actionable summaries. NOT 'system was built' but 'Built Flask API on port 8080 with SQLite backend'.\n"
-        "- Include concrete details: file paths, versions, URLs, error messages, solutions.\n\n"
+        "- For EACH bullet answer: WHAT was done? + WHICH files/configs? + WHAT was the result?\n"
+        "- BAD: 'Fixed the bug' → GOOD: 'Fixed elif→if bug in graph_builder.py:142 causing O(n²) edges'\n"
+        "- BAD: 'System was built' → GOOD: 'Built Flask API on port 8080 with SQLite backend and JWT auth'\n"
+        "- Include concrete details: file paths, line numbers, versions, URLs, error messages, solutions.\n\n"
+
         "TASK 2 — Fact Extraction (key-value pairs with categories):\n"
         "- ATOMICITY: Each fact = ONE atomic fact ONLY. Split multi-fact sentences.\n"
         "- Each fact key must be a COMPLETE SENTENCE with SPECIFIC values.\n"
@@ -267,11 +299,14 @@ def generate_summary(session_id, messages):
         "- BILINGUAL: Extract facts in the SAME language they were discussed. Do NOT translate.\n"
         "- Exclude: transient stats (node counts, file sizes, timestamps), generic phrases ('help was provided').\n"
         "- Include: file paths, URLs, API endpoints, versions, config values, user preferences, decisions made, errors fixed.\n\n"
+
+        f"{FEW_SHOT_EXAMPLES}"
+
         "Respond ONLY with valid JSON in this exact format:\n"
         '{"summary": ["specific point 1", "specific point 2"], '
         '"facts": [{"key": "complete sentence with specific value", "category": "technical"}], '
         '"language": "ar", "importance": 3}\n\n'
-        "Categories: preference, fact, decision, correction, project, technical, personal, service\n\n"
+        "Categories: preference, fact, decision, correction, project, technical, personal, service, general\n\n"
         f"Session conversation:\n{conversation_text}"
     )
 
@@ -333,12 +368,77 @@ def generate_summary(session_id, messages):
             return None
 
 # ============================================================
+# P5: Post-processing importance scorer (overrides model guess)
+# ============================================================
+
+# Keywords that signal high-importance sessions
+_IMPORTANCE_BOOST_KEYWORDS = {
+    'security': 2, 'api_key': 2, 'token': 2, 'secret': 2, 'password': 2,
+    'preference': 1, 'prefer': 1, 'decision': 1, 'decided': 1,
+    'config': 1, 'configuration': 1, 'settings': 1,
+    'bug': 1, 'fix': 1, 'fixed': 1, 'error': 1, 'crash': 1,
+    'migration': 1, 'backup': 1, 'restore': 1, 'data loss': 2,
+    'breaking': 2, 'breaking change': 2,
+    'deploy': 1, 'deployment': 1, 'production': 1,
+    'remove': 1, 'delete': 1, 'cleanup': 1,
+    'refactor': 1, 'rewrite': 1, 'redesign': 1,
+    'threshold': 1, 'community': 1, 'graph': 1,
+    'authentication': 1, 'auth': 1,
+    'permission': 1, 'access': 1, 'role': 1,
+    # Arabic keywords
+    'تفضيل': 1, 'قرار': 1, 'خطأ': 1, 'إصلاح': 1, 'أمان': 2,
+    'مفتاح': 1, 'نقل': 1, 'نسخة احتياطية': 1, 'إعداد': 1,
+}
+
+def compute_importance(session_id, messages, facts, model_importance):
+    """Post-process importance score based on session content analysis.
+    
+    Overrides the model's guess (7B models default to 3 for everything).
+    Returns 0-5 integer.
+    
+    Keyword boost levels:
+    - boost=2 (critical): security, API keys, data loss, breaking changes → importance 5
+    - boost=1 (important): preferences, config, bugs, decisions → importance 3-4
+    - boost=0 (neutral): use model guess
+    """
+    # Analyze session text
+    all_text = ""
+    for msg in messages:
+        content = msg.get("content", "") or ""
+        all_text += " " + content.lower()
+    
+    # Find the highest boost keyword
+    max_boost = 0
+    for keyword, boost in _IMPORTANCE_BOOST_KEYWORDS.items():
+        if keyword in all_text:
+            max_boost = max(max_boost, boost)
+    
+    # Map boost levels to importance scores
+    if max_boost >= 2:
+        score = 5  # Critical: security, API keys, breaking changes, data loss
+    elif max_boost == 1:
+        score = 4  # Important: preferences, config, bugs, decisions
+    else:
+        score = model_importance  # Neutral: use model's guess
+    
+    # Penalty for sessions with only greetings/acknowledgments
+    if len(all_text.strip().split()) < 50:
+        if ('ok' in all_text and 'thanks' in all_text) or \
+           ('done' in all_text and 'thank' in all_text):
+            score = min(score, 1)
+    
+    # Ensure at least 2 if we extracted facts
+    if facts and score < 2:
+        score = 2
+    
+    return max(0, min(5, score))
+
+
+# ============================================================
 # Save results
 # ============================================================
 
 def save_summary(session_id, summary_data):
-    """Save summary to disk (JSONL + SQLite dual-write)."""
-    import fcntl
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
     os.makedirs(FACTS_DIR, exist_ok=True)
 
@@ -354,16 +454,16 @@ def save_summary(session_id, summary_data):
     facts = summary_data.get("facts", [])
     if not isinstance(facts, list):
         facts = []
-
-    # Phase 1: Write facts to JSONL (existing behavior — source of truth)
     saved_count = 0
     for fact in facts:
         if not isinstance(fact, dict):
             continue
+        # P0-5: Use unified quality gate (replaces duplicate SKIP_PHRASES + length checks)
         key = (fact.get("key") or "").strip()
         if not key or len(key) < MIN_FACT_KEY_LENGTH:
             continue
 
+        # P0-1: Use unified quality gate (Arabic-aware + single skip phrases)
         if is_junk_fact(key):
             continue
 
@@ -381,6 +481,7 @@ def save_summary(session_id, summary_data):
             "source": "session_summarizer",
         }
 
+        # File locking to prevent race conditions with graph_updater
         with open(fact_file, "a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
@@ -389,44 +490,7 @@ def save_summary(session_id, summary_data):
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         saved_count += 1
 
-    # Phase 2: Dual-Write to SQLite (non-blocking, best-effort)
-    # JSONL remains source of truth; SQLite failures are logged but don't abort
-    db_count = 0
-    try:
-        _script_dir = str(pathlib.Path(__file__).parent)
-        if _script_dir not in sys.path:
-            sys.path.insert(0, _script_dir)
-        from db import get_db
-        db = get_db()
-        for fact in facts:
-            if not isinstance(fact, dict):
-                continue
-            key = (fact.get("key") or "").strip()
-            if not key or len(key) < MIN_FACT_KEY_LENGTH:
-                continue
-            if is_junk_fact(key):
-                continue
-            category = fact.get("category", "general")
-            if category not in VALID_CATEGORIES:
-                category = "general"
-            try:
-                db.upsert_fact(
-                    key=key,
-                    category=category,
-                    embedding=None,  # graph_updater adds embeddings later
-                    session_id=session_id,
-                    source='session_summarizer',
-                    importance=summary_data.get("importance", 1),
-                )
-                db_count += 1
-            except Exception as e:
-                pass  # Silent — SQLite is secondary, JSONL is truth
-        if db_count > 0:
-            print(f"  SQLite dual-write: {db_count} facts indexed")
-    except Exception as e:
-        print(f"  ⚠ SQLite dual-write unavailable: {e}")
-
-    print(f"  Facts saved: {saved_count} (JSONL) + {db_count} (SQLite)")
+    print(f"  Facts saved: {saved_count}")
     return saved_count
 
 # ============================================================
@@ -514,19 +578,21 @@ def main():
         total_facts += n_facts
         summarized_count += 1
 
+        # P5: Override importance with content-based scoring
+        if summary and isinstance(summary, dict):
+            model_importance = summary.get("importance", 3)
+            facts = summary.get("facts", [])
+            corrected_importance = compute_importance(sid, messages, facts, model_importance)
+            if corrected_importance != model_importance:
+                summary["importance"] = corrected_importance
+                summary["importance_source"] = "post_processing"
+                print(f"  Importance: {model_importance} → {corrected_importance} (post-processed)")
+
         # Persist tracker immediately per-session — crash-safe, no re-summarize
         tracker = load_tracker()
         if sid not in tracker["summarized_sessions"]:
             tracker["summarized_sessions"].append(sid)
             save_tracker(tracker)
-        
-        # P5: Also mark in SQLite for unified session tracking
-        try:
-            from db import get_db
-            db = get_db()
-            db.mark_session_summarized(sid)
-        except Exception:
-            pass  # JSONL tracker is source of truth
 
     if summarized_count:
         print(f"\n✓ Summarized {summarized_count} sessions, {total_facts} facts total")
