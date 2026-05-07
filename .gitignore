@@ -3,3 +3,10 @@ __pycache__/
 .env
 *.db
 *.log
+
+# Coverage and cache
+.coverage
+.coverage.*
+.mypy_cache/
+plugins/unified/.coverage
+plugins/unified/.mypy_cache/
