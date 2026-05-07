@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import hashlib
+import logging
 import networkx as nx
 
 from .document_loader import DocumentLoader
@@ -20,6 +21,8 @@ from .embedding_model import EmbeddingModel
 from .graph_builder import KnowledgeGraphBuilder
 from .community_detector import CommunityDetector
 from .graph_storage import GraphStorage
+
+logger = logging.getLogger(__name__)
 
 
 # حدود أمان
@@ -48,7 +51,7 @@ class GraphifyEngine:
         self.community_algorithm = self.config.get("community_algorithm", "leiden")
         
         # تهيئة المكونات
-        print("جاري تهيئة Graphify Engine...")
+        logger.info("جاري تهيئة Graphify Engine...")
         
         self.loader = DocumentLoader()
         self.splitter = TextSplitter(
@@ -63,7 +66,7 @@ class GraphifyEngine:
         self.detector = CommunityDetector(algorithm=self.community_algorithm)
         self.storage = GraphStorage(self.graphs_dir)
         
-        print("✓ Graphify Engine جاهز")
+        logger.info("✓ Graphify Engine جاهز")
     
     def index_directory(
         self,
@@ -96,24 +99,24 @@ class GraphifyEngine:
         if project_name is None:
             project_name = path.name
         
-        print(f"\n{'='*60}")
-        print(f"فهرسة مشروع: {project_name}")
-        print(f"المسار: {path}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"فهرسة مشروع: {project_name}")
+        logger.info(f"المسار: {path}")
+        logger.info(f"{'='*60}\n")
         
         # التحقق من الفهرسة السابقة
         if not reindex:
             try:
                 existing_graph = self.storage.load(project_name)
-                print(f"⚠️ رسم موجود مسبقاً ({existing_graph.number_of_nodes()} عقدة)")
-                print("  استخدم reindex=True لإعادة الفهرسة الكاملة\n")
+                logger.info(f"⚠️ رسم موجود مسبقاً ({existing_graph.number_of_nodes()} عقدة)")
+                logger.info("  استخدم reindex=True لإعادة الفهرسة الكاملة\n")
             except FileNotFoundError:
                 pass  # لا يوجد رسم سابق
         
         # 1. تحميل المستندات
-        print("المرحلة 1/6: تحميل المستندات...")
+        logger.info("المرحلة 1/6: تحميل المستندات...")
         docs = self.loader.load_directory(str(path), patterns, recursive)
-        print(f"  ✓ تم تحميل {len(docs)} وثيقة\n")
+        logger.info(f"  ✓ تم تحميل {len(docs)} وثيقة\n")
         
         if not docs:
             return {
@@ -123,16 +126,16 @@ class GraphifyEngine:
             }
         
         # 2. تقسيم النصوص
-        print("المرحلة 2/6: تقسيم النصوص...")
+        logger.info("المرحلة 2/6: تقسيم النصوص...")
         split_docs = []
         for doc in docs:
             file_type = Path(doc.metadata.get("source", "")).suffix.lower().replace(".", "")
             chunks = self.splitter.split([doc], file_type or None)
             split_docs.extend(chunks)
-        print(f"  ✓ تم تقسيم إلى {len(split_docs)} قطعة\n")
+        logger.info(f"  ✓ تم تقسيم إلى {len(split_docs)} قطعة\n")
         
         # 3. بناء الرسم
-        print("المرحلة 3/6: بناء الرسم المعرفي...")
+        logger.info("المرحلة 3/6: بناء الرسم المعرفي...")
         self.builder = KnowledgeGraphBuilder(self.embedding)
         node_ids = self.builder.add_nodes_from_docs(
             [{"page_content": d.page_content, "metadata": d.metadata} for d in split_docs],
@@ -146,12 +149,12 @@ class GraphifyEngine:
                 f"المجلد كبير جداً — قسمه أو استخدم patterns أضيق."
             )
         if num_nodes > MAX_NODES_WARNING:
-            print(f"  ⚠️ تحذير: {num_nodes:,} عقدة (أقرب من الحد الأقصى {MAX_NODES_HARD:,})")
+            logger.info(f"  ⚠️ تحذير: {num_nodes:,} عقدة (أقرب من الحد الأقصى {MAX_NODES_HARD:,})")
         
-        print(f"  ✓ تمت إضافة {num_nodes} عقدة\n")
+        logger.info(f"  ✓ تمت إضافة {num_nodes} عقدة\n")
         
         # 4. إضافة الحواف
-        print("المرحلة 4/6: إضافة الحواف الدلالية...")
+        logger.info("المرحلة 4/6: إضافة الحواف الدلالية...")
         edges_added = self.builder.add_edges_by_similarity(
             threshold=self.similarity_threshold,
             batch_size=100,
@@ -159,25 +162,25 @@ class GraphifyEngine:
         
         # تحقق: تحذير إذا الحواف كثيرة
         if edges_added > MAX_EDGES_WARNING:
-            print(f"  ⚠️ تحذير: {edges_added:,} حافة — كثافة عالية قد تؤثر على الأداء")
+            logger.info(f"  ⚠️ تحذير: {edges_added:,} حافة — كثافة عالية قد تؤثر على الأداء")
         
-        print(f"  ✓ تمت إضافة {edges_added} حافة\n")
+        logger.info(f"  ✓ تمت إضافة {edges_added} حافة\n")
         
         # 5. اكتشاف المجتمعات
-        print("المرحلة 5/6: اكتشاف المجموعات الدلالية...")
+        logger.info("المرحلة 5/6: اكتشاف المجموعات الدلالية...")
         communities = self.detector.detect(self.builder.graph)
-        print(f"  ✓ تم اكتشاف {communities['num_communities']} مجتمعات")
-        print(f"    Modularity Score: {communities['modularity']:.4f}\n")
+        logger.info(f"  ✓ تم اكتشاف {communities['num_communities']} مجتمعات")
+        logger.info(f"    Modularity Score: {communities['modularity']:.4f}\n")
         
         # 6. الحفظ
-        print("المرحلة 6/6: حفظ الرسم...")
+        logger.info("المرحلة 6/6: حفظ الرسم...")
         saved_files = self.storage.save(
             self.builder.graph,
             communities,
             project_name,
             generate_report=True,
         )
-        print(f"  ✓ تم الحفظ في {self.storage.graphs_dir / project_name}\n")
+        logger.info(f"  ✓ تم الحفظ في {self.storage.graphs_dir / project_name}\n")
         
         # تقرير نهائي
         end_time = datetime.now()
@@ -208,9 +211,9 @@ class GraphifyEngine:
             },
         }
         
-        print(f"{'='*60}")
-        print(f"✅ اكتملت الفهرسة في {duration:.2f} ثانية")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info(f"✅ اكتملت الفهرسة في {duration:.2f} ثانية")
+        logger.info(f"{'='*60}\n")
         
         return report
     

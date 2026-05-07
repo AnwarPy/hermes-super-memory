@@ -71,6 +71,16 @@ chmod +x install.sh && ./install.sh
 hermes gateway restart
 ```
 
+## 🗑️ Uninstall / إزالة
+
+To completely remove the plugin:
+
+```bash
+./uninstall.sh
+```
+
+This removes all plugin files while preserving your memory data and graph files.
+
 ---
 
 ## 📁 Project Structure / هيكل المشروع
