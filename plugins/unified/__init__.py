@@ -704,10 +704,47 @@ class UnifiedMemoryProvider(MemoryProvider, AgentIdMixin):
         if self._ft_db:
             try:
                 fts5_results = self._ft_db.search_messages(
-                    query, 
+                    query,
                     limit=limit,
                     role_filter=["user", "assistant"]  # فقط رسائل المستخدم والمساعد
                 )
+                # P2-fix: Arabic LIKE fallback when FTS5 returns 0 results
+                # FTS5 default tokenizer doesn't handle Arabic affixes (الـ prefix, etc.)
+                if not fts5_results and re.search(r'[\u0621-\u064A]', query):
+                    try:
+                        import sqlite3, unicodedata
+                        def _normalize_arabic(t):
+                            t = unicodedata.normalize('NFC', t)
+                            t = re.sub(r'[\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]', '', t)
+                            t = re.sub(r'[أإآٱ]', 'ا', t)
+                            t = t.replace('ى', 'ي').replace('ئ', 'ي').replace('ة', 'ه')
+                            return t.strip()
+                        norm_q = _normalize_arabic(query)
+                        db_path = self._ft_db.db_path if hasattr(self._ft_db, 'db_path') else None
+                        if db_path:
+                            conn = sqlite3.connect(db_path)
+                            # Try 1: LIKE on full normalized phrase
+                            rows = conn.execute(
+                                "SELECT rowid, content, role FROM messages WHERE content_normalized LIKE ? AND role IN ('user', 'assistant') ORDER BY timestamp DESC LIMIT ?",
+                                [f'%{norm_q}%', limit]
+                            ).fetchall()
+                            # Try 2: Multi-word LIKE (AND each word)
+                            if not rows:
+                                words = norm_q.split()
+                                if len(words) > 1:
+                                    conditions = ' AND '.join([f'content_normalized LIKE ?' for _ in words])
+                                    params = [f'%{w}%' for w in words]
+                                    rows = conn.execute(
+                                        f"SELECT rowid, content, role FROM messages WHERE {conditions} AND role IN ('user', 'assistant') ORDER BY timestamp DESC LIMIT ?",
+                                        params + [limit]
+                                    ).fetchall()
+                            fts5_results = [
+                                {'snippet': r[1], 'role': r[2], 'timestamp': None}
+                                for r in rows
+                            ]
+                            conn.close()
+                    except Exception:
+                        pass
                 for i, r in enumerate(fts5_results):
                     snippet = _clean_chunk(r.get('snippet', ''), max_len=300)
                     if snippet:

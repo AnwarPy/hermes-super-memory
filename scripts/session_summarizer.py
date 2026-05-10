@@ -507,13 +507,15 @@ def _write_fact_to_memory_store(content, category, importance):
         return
     try:
         trust = {1: 0.3, 2: 0.5, 3: 0.7, 4: 0.85, 5: 1.0}.get(importance, 0.5)
+        # Normalize content for FTS5 Arabic search
+        content_normalized = normalize_arabic(content)
         conn = sqlite3.connect(MEMORY_STORE_DB)
 
         # Insert fact — FTS5 trigger (facts_ai) handles index sync automatically
         conn.execute(
-            """INSERT OR IGNORE INTO facts (content, category, tags, trust_score, created_at, updated_at)
-               VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))""",
-            (content, category, '', trust)
+            """INSERT OR IGNORE INTO facts (content, content_normalized, category, tags, trust_score, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+            (content, content_normalized, category, '', trust)
         )
 
         # Extract entities from content and link to fact
