@@ -28,6 +28,9 @@ TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.summarizer_tracker.json")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.getenv("HERMES_SUMMARIZER_MODEL", "qwen2.5:7b")
 
+# v3.5 Unified Memory DB — write facts here alongside JSONL
+MEMORY_STORE_DB = os.path.expanduser("~/.hermes/memory_store.db")
+
 BATCH_SIZE = 5
 MAX_MESSAGES_PER_SESSION = 100
 
@@ -488,10 +491,78 @@ def save_summary(session_id, summary_data):
                 f.write(json.dumps(fact_entry, ensure_ascii=False) + "\n")
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        # Write to v3.5 Unified Memory DB
+        _write_fact_to_memory_store(key, category, summary_data.get("importance", 1))
+
         saved_count += 1
 
     print(f"  Facts saved: {saved_count}")
     return saved_count
+
+
+def _write_fact_to_memory_store(content, category, importance):
+    """Insert a fact into the v3.5 memory_store.db (Unified Memory) + extract entities."""
+    if not os.path.exists(MEMORY_STORE_DB):
+        return
+    try:
+        trust = {1: 0.3, 2: 0.5, 3: 0.7, 4: 0.85, 5: 1.0}.get(importance, 0.5)
+        conn = sqlite3.connect(MEMORY_STORE_DB)
+
+        # Insert fact — FTS5 trigger (facts_ai) handles index sync automatically
+        conn.execute(
+            """INSERT OR IGNORE INTO facts (content, category, tags, trust_score, created_at, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))""",
+            (content, category, '', trust)
+        )
+
+        # Extract entities from content and link to fact
+        entities = _extract_entities(content)
+        if entities:
+            for name, etype in entities:
+                try:
+                    conn.execute(
+                        "INSERT INTO entities (name, entity_type, aliases) VALUES (?, ?, ?)",
+                        (name, etype, '')
+                    )
+                    eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                except sqlite3.IntegrityError:
+                    eid = conn.execute(
+                        "SELECT entity_id FROM entities WHERE name = ?", (name,)
+                    ).fetchone()[0]
+
+                fact_id = conn.execute(
+                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
+                ).fetchone()[0]
+
+                if fact_id and eid:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                        (fact_id, eid)
+                    )
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  WARN: Failed to write to memory_store.db: {e}")
+
+
+def _extract_entities(text):
+    """Extract entity names from fact content using regex patterns."""
+    entities = set()
+    # Person names, platforms, ports, file paths, versions
+    for pattern, etype in [
+        (r'\b(Multica|Hermes|Telegram|OpenClaw|Claude|Qwen|Gemma|WSL|Ollama)\b', 'platform'),
+        (r'@([A-Za-z0-9_]+bot)', 'telegram_bot'),
+        (r'\b(v?\d+\.\d+(?:\.\d+)?)\b', 'version'),
+        (r'(?:port|gateway)\s+(\d{4,5})', 'port'),
+        (r'(/[^\s]{10,})', 'file_path'),
+    ]:
+        for match in re.finditer(pattern, text):
+            name = match.group(1) if match.lastindex >= 1 else match.group(0)
+            if len(name) >= 2:
+                entities.add((name, etype))
+    return entities
 
 # ============================================================
 # Main
