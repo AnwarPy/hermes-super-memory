@@ -35,6 +35,7 @@ FACTS_DIR = os.path.expanduser("~/.hermes/memory/facts_auto")
 GRAPHS_DIR = os.path.expanduser("~/.hermes/graphs")
 PROJECT_NAME = "hermes-memory"
 TRACKER_FILE = os.path.expanduser("~/.hermes/memory/.graph_tracker.json")
+MEMORY_STORE_DB = os.path.expanduser("~/.hermes/memory_store.db")
 
 EMBEDDING_DIM = 1024  # BGE-M3 dimension
 
@@ -195,7 +196,7 @@ def save_graph(graph):
             g = ig.Graph()
             g.add_vertices(len(node_list))
             edge_tuples = [(node_idx[u], node_idx[v]) for u, v, _ in similar_edges]
-            edge_weights = [w for _, _, w in similar_edges]
+            edge_weights = [float(d.get("weight", 1.0)) for _, _, d in similar_edges]
             g.add_edges(edge_tuples)
             g.es["weight"] = edge_weights
             partition = leidenalg.find_partition(
@@ -272,6 +273,10 @@ def read_new_facts():
                     fact_hash = hashlib.md5(key_normalized.encode()).hexdigest()
 
                     if fact_hash not in indexed:
+                        # Enrich from memory_store.db if available
+                        db_data = _enrich_from_db(key, fact.get("category", file_category))
+                        if db_data:
+                            fact.update(db_data)
                         new_facts.append(fact)
                         # NOTE: Do NOT mark hash as indexed here. The hash is registered
                         # in main() ONLY after add_facts_to_graph succeeds. This prevents
@@ -280,6 +285,47 @@ def read_new_facts():
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     return new_facts, indexed
+
+
+def _enrich_from_db(key, category):
+    """Enrich a fact with data from memory_store.db (trust_score, entities, category)."""
+    if not os.path.exists(MEMORY_STORE_DB):
+        return None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(MEMORY_STORE_DB)
+
+        # Look up the fact
+        row = conn.execute(
+            "SELECT fact_id, content, category, trust_score FROM facts WHERE content = ?",
+            (key,)
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return None
+
+        fact_id, content, db_category, trust_score = row
+
+        # Get entities linked to this fact
+        entities = conn.execute(
+            """SELECT e.name, e.entity_type
+               FROM fact_entities fe
+               JOIN entities e ON fe.entity_id = e.entity_id
+               WHERE fe.fact_id = ?""",
+            (fact_id,)
+        ).fetchall()
+
+        conn.close()
+
+        result = {
+            "trust_score": trust_score,
+            "db_category": db_category,
+            "db_entities": [{"name": e[0], "type": e[1]} for e in entities],
+        }
+        return result
+    except Exception:
+        return None
 
 # ============================================================
 # Orphan node cleanup — remove fact nodes no longer in JSONL files
@@ -402,7 +448,12 @@ def add_facts_to_graph(graph, facts):
         if category not in VALID_CATEGORIES:
             category = "general"
         session_id = fact.get("session_id", "")
-        importance = fact.get("importance", 1)
+        # Use trust_score from DB enrichment, fall back to importance→trust mapping
+        trust_score = fact.get("trust_score")
+        if trust_score is None:
+            importance = fact.get("importance", 1)
+            trust_score = {1: 0.3, 2: 0.5, 3: 0.7, 4: 0.85, 5: 1.0}.get(importance, 0.5)
+        entities = fact.get("db_entities", [])
 
         if not key:
             continue
@@ -437,8 +488,11 @@ def add_facts_to_graph(graph, facts):
                     5,
                     max(
                         existing.get("importance", 1),
-                        importance,
+                        round(trust_score * 5),  # trust_score 0-1 → importance 1-5
                     )  # لا نزيد تلقائياً، فقط نضمن الأعلى
+                )
+                existing["trust_score"] = max(
+                    existing.get("trust_score", 0.0), trust_score
                 )
                 existing["seen_count"] = existing.get("seen_count", 1) + 1
                 existing["last_seen_at"] = now
@@ -476,7 +530,8 @@ def add_facts_to_graph(graph, facts):
                                     # Refinement — merge into existing
                                     if target and graph.has_node(target):
                                         existing = graph.nodes[target]
-                                        existing["importance"] = max(existing.get("importance", 1), importance)
+                                        existing["importance"] = max(existing.get("importance", 1), round(trust_score * 5))
+                                        existing["trust_score"] = max(existing.get("trust_score", 0.0), trust_score)
                                         existing["seen_count"] = existing.get("seen_count", 1) + 1
                                         existing["last_seen_at"] = now
                                         aliases = existing.get("aliases", [])
@@ -506,7 +561,9 @@ def add_facts_to_graph(graph, facts):
                     type="fact",
                     category=category,
                     session_id=session_id,
-                    importance=importance,
+                    importance=round(trust_score * 5),
+                    trust_score=trust_score,
+                    entities=entities,
                     seen_count=1,
                     created_at=now,
                     last_seen_at=now,
