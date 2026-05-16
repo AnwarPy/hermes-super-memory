@@ -232,62 +232,116 @@ def generate_summary(session_id, messages):
     import urllib.request
 
     conversation_lines = []
+    full_conversation_lines = []  # P9-FIX: untruncated copy for hallucination checking
     for msg in messages:
         role = msg.get("role", "unknown")
         content = msg.get("content") or ""
-        if len(content) > 500:
-            content = content[:500] + "... [truncated]"
         if not content.strip():
             continue
-        conversation_lines.append(f"[{role}]: {content}")
+        if len(content) > 500:
+            truncated = content[:500] + "... [truncated]"
+        else:
+            truncated = content
+        conversation_lines.append(f"[{role}]: {truncated}")
+        full_conversation_lines.append(f"[{role}]: {content}")
 
     conversation_text = "\n".join(conversation_lines)
+    full_conversation_text = "\n".join(full_conversation_lines)  # P9: untruncated
 
     # كشف لغة الجلسة تلقائياً (#8)
-    arabic_chars = sum(1 for c in conversation_text if '\u0600' <= c <= '\u06FF')
-    total_chars = len(conversation_text.strip())
-    is_arabic_session = (arabic_chars / max(total_chars, 1)) > 0.3
+    # P10-FIX: Only analyze USER messages for language detection
+    # Context compaction and tool outputs are always English → skew results
+    user_text = " ".join(
+        msg.get("content") or ""
+        for msg in messages
+        if msg.get("role") == "user"
+    )
+    arabic_chars = sum(1 for c in user_text if '\u0600' <= c <= '\u06FF')
+    total_chars = max(len(user_text.strip()), 1)
+    is_arabic_session = (arabic_chars / total_chars) > 0.30
+
+    # P8-FIX: Progressive Arabic instructions (no .replace() — use array indexing)
+    ARABIC_INSTRUCTIONS = [
+        "أجب بالعربية الفصحى فقط. لا تستخدم الإنجليزية إلا للأسماء التقنية.",
+        "⚠️ تحذير: يجب أن تجيب بالعربية الفصحى فقط. ممنوع منعاً باتاً استخدام أي كلمة إنجليزية. كل كلمة يجب أن تكون عربية. حتى الأسماء التقنية اكتبها بالعربية. هذا أمر إلزامي.",
+        "🚨 آخر فرصة: ستُرفض الإجابة تلقائياً إن وُجدت أي كلمة إنجليزية. اكتب كل شيء بالعربية الفصحى فقط. ممنوع الإنجليزية تماماً.",
+    ]
 
     lang_instruction = (
-        "أجب بالعربية الفصحى فقط. لا تستخدم الإنجليزية إلا للأسماء التقنية."
+        ARABIC_INSTRUCTIONS[0]
         if is_arabic_session else
         "Respond in English only."
     )
 
     # P5: Few-shot examples + structured importance rules for 7B model
-    FEW_SHOT_EXAMPLES = (
-        "EXAMPLE 1 — GOOD output:\n"
-        '{"summary": ['
-        '"Fixed elif→if bug in graph_builder.py line 142 that caused O(n²) edge creation",'
-        '"Added SIMILAR_EDGE_THRESHOLD=0.82 constant to replace hardcoded 0.70 value",'
-        '"Integrated Leiden community detection — detected 70 communities from 738 nodes"'
-        '], "facts": ['
-        '{"key": "Similar edge threshold is 0.82, defined as SIMILAR_EDGE_THRESHOLD constant", "category": "technical"},'
-        '{"key": "Leiden community detection runs after every graph save in save_graph()", "category": "technical"},'
-        '{"key": "User prefers concise Arabic responses with technical terminology", "category": "preference"}'
-        '], "language": "en", "importance": 4}\n\n'
+    if is_arabic_session:
+        FEW_SHOT_EXAMPLES = (
+            "مثال ١ — مخرج صحيح (بالعربية):\n"
+            '{"summary": ['
+            '"إصلاح خطأ elif→if في graph_builder.py سطر 142 كان يسبب إنشاء أضلاع O(n²)",'
+            '"إضافة ثابت SIMILAR_EDGE_THRESHOLD=0.82 بدل القيمة 0.70 المضمنة",'
+            '"تفعيل خوارزمية Leiden لاكتشاف المجتمعات — 70 مجتمع من 738 عقدة"'
+            '], "facts": ['
+            '{"key": "حد التشابه SIMILAR_EDGE_THRESHOLD=0.82 معرف كثابت في graph_builder.py", "category": "technical"},'
+            '{"key": "خوارزمية Leiden تعمل بعد كل حفظ للرسم في save_graph()", "category": "technical"},'
+            '{"key": "المستخدم يفضل الردود العربية المختصرة مع المصطلحات التقنية", "category": "preference"}'
+            '], "language": "ar", "importance": 4}\n\n'
 
-        "EXAMPLE 2 — BAD output (DO NOT DO THIS):\n"
-        '{"summary": ["Sessions summarized: 5", "The system was built"], '
-        '"facts": [{"key": "Number of nodes is 941", "category": "technical"}, '
-        '{"key": "Total communities: 0", "category": "technical"}], '
-        '"language": "en", "importance": 3}\n'
-        "Why this is bad: generic bullets, snapshot stats instead of lasting facts.\n\n"
+            "مثال ٢ — مخرج خاطئ (لا تفعل هذا):\n"
+            '{"summary": ["تم تلخيص ٥ جلسات", "تم بناء النظام"], '
+            '"facts": [{"key": "عدد العقد ٩٤١", "category": "technical"}, '
+            '{"key": "عدد المجتمعات: ٠", "category": "technical"}], '
+            '"language": "ar", "importance": 3}\n'
+            "لماذا هذا خاطئ: نقاط عامة، إحصائيات لحظية بدل حقائق دائمة.\n\n"
 
-        "EXAMPLE 3 — BAD output (NEGATIVE facts):\n"
-        '{"summary": ["Checked OpenClaw status — running fine"], '
-        '"facts": [{"key": "lmstudio is not involved in current task", "category": "technical"}, '
-        '{"key": "No issues found with gateway", "category": "technical"}], '
-        '"language": "ar", "importance": 3}\n'
-        "Why this is bad: negative facts (what ISNT relevant) are useless. Only extract what WAS done/found/decided.\n\n"
+            "مثال ٣ — مخرج خاطئ (حقائق سلبية):\n"
+            '{"summary": ["التحقق من حالة OpenClaw — يعمل"], '
+            '"facts": [{"key": "لم يتم استخدام lmstudio", "category": "technical"}, '
+            '{"key": "لا توجد مشاكل في البوابة", "category": "technical"}], '
+            '"language": "ar", "importance": 3}\n'
+            "لماذا هذا خاطئ: الحقائق السلبية (ما لم يحدث) غير مفيدة. استخرج فقط ما تم فعله/اكتشافه/اتخاذه.\n\n"
 
-        "IMPORTANCE RULES (use these, do not guess):\n"
-        "- 5: Security fixes, API key changes, data loss bugs, breaking changes\n"
-        "- 4: User preferences, project decisions, config changes, bug fixes with root cause\n"
-        "- 3: Technical implementations, new features, file modifications, deployments\n"
-        "- 2: Routine tasks, code reviews, discussions without concrete outcomes\n"
-        "- 1: Test messages, acknowledgments, greetings, idle sessions\n"
-    )
+            "قواعد الأهمية (استخدمها، لا تخمن):\n"
+            "- ٥: إصلاحات أمنية، تغيير مفاتيح API، أخطاء فقدان بيانات، تغييرات جذرية\n"
+            "- ٤: تفضيلات المستخدم، قرارات المشروع، تغييرات الإعدادات، إصلاحات الأخطاء\n"
+            "- ٣: تطبيقات تقنية، ميزات جديدة، تعديل ملفات، نشر\n"
+            "- ٢: مهام روتينية، مراجعات الكود، نقاشات بدون نتائج ملموسة\n"
+            "- ١: رسائل اختبار، إقرارات، ترحيبات، جلسات خاملة\n"
+        )
+    else:
+        FEW_SHOT_EXAMPLES = (
+            "EXAMPLE 1 — GOOD output:\n"
+            '{"summary": ['
+            '"Fixed elif→if bug in graph_builder.py line 142 that caused O(n²) edge creation",'
+            '"Added SIMILAR_EDGE_THRESHOLD=0.82 constant to replace hardcoded 0.70 value",'
+            '"Integrated Leiden community detection — detected 70 communities from 738 nodes"'
+            '], "facts": ['
+            '{"key": "Similar edge threshold is 0.82, defined as SIMILAR_EDGE_THRESHOLD constant", "category": "technical"},'
+            '{"key": "Leiden community detection runs after every graph save in save_graph()", "category": "technical"},'
+            '{"key": "User prefers concise Arabic responses with technical terminology", "category": "preference"}'
+            '], "language": "en", "importance": 4}\n\n'
+
+            "EXAMPLE 2 — BAD output (DO NOT DO THIS):\n"
+            '{"summary": ["Sessions summarized: 5", "The system was built"], '
+            '"facts": [{"key": "Number of nodes is 941", "category": "technical"}, '
+            '{"key": "Total communities: 0", "category": "technical"}], '
+            '"language": "en", "importance": 3}\n'
+            "Why this is bad: generic bullets, snapshot stats instead of lasting facts.\n\n"
+
+            "EXAMPLE 3 — BAD output (NEGATIVE facts):\n"
+            '{"summary": ["Checked OpenClaw status — running fine"], '
+            '"facts": [{"key": "lmstudio is not involved in current task", "category": "technical"}, '
+            '{"key": "No issues found with gateway", "category": "technical"}], '
+            '"language": "en", "importance": 3}\n'
+            "Why this is bad: negative facts (what ISNT relevant) are useless. Only extract what WAS done/found/decided.\n\n"
+
+            "IMPORTANCE RULES (use these, do not guess):\n"
+            "- 5: Security fixes, API key changes, data loss bugs, breaking changes\n"
+            "- 4: User preferences, project decisions, config changes, bug fixes with root cause\n"
+            "- 3: Technical implementations, new features, file modifications, deployments\n"
+            "- 2: Routine tasks, code reviews, discussions without concrete outcomes\n"
+            "- 1: Test messages, acknowledgments, greetings, idle sessions\n"
+        )
 
     prompt = (
         f"You are an expert session summarizer and fact extractor. {lang_instruction}\n\n"
@@ -340,46 +394,154 @@ def generate_summary(session_id, messages):
         }
     }
 
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            req = urllib.request.Request(
-                OLLAMA_URL,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=120) as response:
-                result = json.loads(response.read().decode("utf-8"))
+    # P8: Language-enforcement retry loop (max 3 attempts for Arabic sessions)
+    language_retries = 3  # only for Arabic sessions
+    best_arabic_ratio = 0  # track best attempt for error logging
+    for lang_attempt in range(language_retries if is_arabic_session else 1):
+        # P8-FIX: Progressive instructions via array index
+        current_lang_instruction = ARABIC_INSTRUCTIONS[min(lang_attempt, len(ARABIC_INSTRUCTIONS)-1)]
+        
+        # Rebuild prompt with the (possibly stricter) language instruction
+        # For retries: replace the PREVIOUS instruction with the CURRENT one
+        prev_idx = max(0, lang_attempt - 1) if lang_attempt > 0 else 0
+        current_prompt = prompt.replace(
+            ARABIC_INSTRUCTIONS[prev_idx],
+            current_lang_instruction
+        ) if lang_attempt > 0 else prompt
+        
+        current_payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a JSON-only session summarizer. Return ONLY valid JSON, no markdown fences, no explanation. Be concise."
+                },
+                {"role": "user", "content": current_prompt}
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+                "num_predict": 1500,
+            }
+        }
+        
+        max_retries = 2
+        parsed = None
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    OLLAMA_URL,
+                    data=json.dumps(current_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    result = json.loads(response.read().decode("utf-8"))
 
-            content = result.get("message", {}).get("content", "")
-            return robust_json_parse(content)
+                content = result.get("message", {}).get("content", "")
+                parsed = robust_json_parse(content)
+                break  # success, exit retry loop
 
-        except urllib.error.URLError as e:
-            # Explicit timeout handling
-            if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
-                print(f"  Ollama timeout (attempt {attempt+1}), retrying...")
+            except urllib.error.URLError as e:
+                if hasattr(e, 'reason') and 'timed out' in str(e.reason).lower():
+                    print(f"  Ollama timeout (attempt {attempt+1}), retrying...")
+                    if attempt < max_retries:
+                        continue
+                    print(f"  Ollama timeout after {max_retries+1} attempts, skipping session")
+                    return None
+                print(f"  Ollama network error: {e}")
+                return None
+            except TimeoutError:
+                print(f"  Ollama timeout (attempt {attempt+1})")
                 if attempt < max_retries:
                     continue
-                print(f"  Ollama timeout after {max_retries+1} attempts, skipping session")
                 return None
-            print(f"  Ollama network error: {e}")
+            except json.JSONDecodeError as e:
+                if attempt < max_retries:
+                    print(f"  JSON parse failed (attempt {attempt+1}), retrying...")
+                    current_payload["options"]["num_predict"] = 2000
+                    continue
+                print(f"  JSON parse failed after {max_retries+1} attempts: {e}")
+                return None
+            except Exception as e:
+                print(f"  Ollama call failed: {e}")
+                return None
+        
+        if parsed is None:
             return None
-        except TimeoutError:
-            print(f"  Ollama timeout (attempt {attempt+1})")
-            if attempt < max_retries:
+
+        # P8: Language enforcement — check if output matches session language
+        if is_arabic_session:
+            summary_text = " ".join(parsed.get("summary", []))
+            facts_text = " ".join(f.get("key", "") for f in parsed.get("facts", []))
+            combined = summary_text + " " + facts_text
+            arabic_ratio = sum(1 for c in combined if '\u0621' <= c <= '\u064A') / max(len(combined), 1)
+            
+            # Track best attempt for error logging
+            if arabic_ratio > best_arabic_ratio:
+                best_arabic_ratio = arabic_ratio
+            
+            if arabic_ratio < 0.25:  # <25% Arabic = unacceptable
+                if lang_attempt < language_retries - 1:
+                    print(f"  ⚠️ Language rejection: output is {arabic_ratio*100:.0f}% Arabic (attempt {lang_attempt+1}), retrying with stricter prompt...")
+                    # P8-FIX: Update prompt for next iteration using progressive instruction
+                    prompt = current_prompt.replace(
+                        current_lang_instruction,
+                        ARABIC_INSTRUCTIONS[min(lang_attempt+1, len(ARABIC_INSTRUCTIONS)-1)]
+                    )
+                    continue  # go to next lang_attempt with new prompt
+                else:
+                    # P8-FIX: All retries failed — return None, don't waste resources
+                    print(f"  ❌ Language rejection: all {language_retries} attempts produced <25% Arabic (best: {best_arabic_ratio*100:.0f}%). Skipping session.")
+                    return None
+            else:
+                parsed["language"] = "ar"  # Good: output has Arabic
+        else:
+            parsed["language"] = "en"
+        
+        break  # language check passed
+    
+    # P9: Anti-hallucination guard (applies to BOTH Arabic and English sessions)
+    if parsed:
+        facts = parsed.get("facts", [])
+        verified_facts = []
+        
+        # P9-FIX: Use Jaccard similarity on full untruncated normalized text
+        norm_full = normalize_arabic(full_conversation_text.lower())
+        norm_full_words = set(norm_full.split())
+        
+        for fact in facts:
+            key = fact.get("key", "")
+            if not key:
                 continue
-            return None
-        except json.JSONDecodeError as e:
-            if attempt < max_retries:
-                print(f"  JSON parse failed (attempt {attempt+1}), retrying...")
-                payload["options"]["num_predict"] = 2000
+            
+            # Normalize both fact and conversation for comparison
+            norm_key = normalize_arabic(key.lower())
+            fact_words = [w for w in norm_key.split() if len(w) > 2]  # skip very short words
+            
+            if not fact_words:
                 continue
-            print(f"  JSON parse failed after {max_retries+1} attempts: {e}")
-            return None
-        except Exception as e:
-            print(f"  Ollama call failed: {e}")
-            return None
+            
+            # Jaccard-like: what fraction of fact words appear in the conversation?
+            matched = 0
+            for w in fact_words:
+                # Check as substring (handles Arabic morphology: "أصلح" in "أصلحت")
+                if any(w in cw or cw in w for cw in norm_full_words):
+                    matched += 1
+                elif w in norm_full:  # fallback: raw substring match
+                    matched += 1
+            
+            ratio = matched / len(fact_words)
+            if ratio >= 0.40:  # at least 40% of fact words grounded in conversation
+                verified_facts.append(fact)
+            else:
+                print(f"  🚫 Hallucination rejected ({ratio*100:.0f}% match): '{key[:80]}...'")
+        
+        if len(verified_facts) < len(facts):
+            print(f"  Anti-hallucination: kept {len(verified_facts)}/{len(facts)} facts")
+        parsed["facts"] = verified_facts
+    
+    return parsed
 
 # ============================================================
 # P5: Post-processing importance scorer (overrides model guess)
