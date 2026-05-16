@@ -52,6 +52,16 @@ SKIP_PHRASES = [
     "المحادثة كانت حول", "تم تقديم المساعدة", "تم التحقق من",
     "تم بناء النظام", "تم تثبيت جميع", "تم ارسال تعليمات",
     "لا توجد تفاصيل", "لا يوجد", "لم يتم",
+    # P7: Negative/vacuous facts — what ISN'T relevant/used/done
+    "was not involved", "was not used", "is not used", "not relevant",
+    "not related", "did not involve", "was not part",
+    "not directly", "no changes", "no issues", "no problems",
+    "nothing to report", "no action", "no updates",
+    "لم يتم استخدام", "لم يكن", "ليس جزءا", "غير مستخدم",
+    "غير مرتبط", "لا يتعلق", "لا تأثير", "لم يشارك",
+    "غير مباشر", "غير معني", "لا مشاكل", "لا تغييرات",
+    # Arabic negative patterns (partial match)
+    "غير متصل", "غير موجود", "لم يشارك في", "ليس له علاقه",
 ]
 
 MIN_FACT_KEY_LENGTH_AR = 10
@@ -71,6 +81,16 @@ def is_sensitive_fact(key: str) -> bool:
     if _SENSITIVE_PATTERN.search(key_stripped) and len(key_stripped.split()) <= 5:
         return True
     return False
+
+
+# P7: CJK character detection — reject facts containing Chinese/Japanese/Korean
+# These slip through when qwen2.5:7b switches languages mid-output
+_CJK_RE = re.compile(r'[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]')
+
+
+def is_cjk_text(key: str) -> bool:
+    """Reject facts containing CJK characters (Chinese/Japanese/Korean)."""
+    return bool(_CJK_RE.search(key))
 
 
 # ============================================================
@@ -140,6 +160,10 @@ def is_junk_fact(key: str) -> bool:
 
     # P0-1: Security gate
     if is_sensitive_fact(key):
+        return True
+
+    # P7: Reject CJK (Chinese/Japanese/Korean) — language-switch artifacts
+    if is_cjk_text(key):
         return True
 
     # Length check

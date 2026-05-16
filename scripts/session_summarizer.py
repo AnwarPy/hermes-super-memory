@@ -274,6 +274,13 @@ def generate_summary(session_id, messages):
         '"language": "en", "importance": 3}\n'
         "Why this is bad: generic bullets, snapshot stats instead of lasting facts.\n\n"
 
+        "EXAMPLE 3 — BAD output (NEGATIVE facts):\n"
+        '{"summary": ["Checked OpenClaw status — running fine"], '
+        '"facts": [{"key": "lmstudio is not involved in current task", "category": "technical"}, '
+        '{"key": "No issues found with gateway", "category": "technical"}], '
+        '"language": "ar", "importance": 3}\n'
+        "Why this is bad: negative facts (what ISNT relevant) are useless. Only extract what WAS done/found/decided.\n\n"
+
         "IMPORTANCE RULES (use these, do not guess):\n"
         "- 5: Security fixes, API key changes, data loss bugs, breaking changes\n"
         "- 4: User preferences, project decisions, config changes, bug fixes with root cause\n"
@@ -297,6 +304,10 @@ def generate_summary(session_id, messages):
         "- BAD: 'project_directory' → GOOD: 'Project source code is at /home/anwar/multica-source'\n"
         "- BAD: 'dependencies_installed' → GOOD: 'Installed pnpm 10.28.2, Node.js 22, Docker, PostgreSQL 17'\n"
         "- BAD: 'graph contains 13 nodes' → SKIP (snapshot stats, not a lasting fact)\n"
+        "- ONLY extract POSITIVE facts about what WAS done/discovered/decided. NEVER extract facts about what was NOT done/relevant/used.\n"
+        "- BAD: 'lmstudio was not involved' → SKIP (negative fact, useless)\n"
+        "- BAD: 'No issues found with gateway' → SKIP (negative fact, useless)\n"
+        "- STAY in the session language: if session is Arabic, ALL facts MUST be in Arabic. If English, ALL facts in English. NO mixing, NO Chinese.\n"
         "- NO INFERENCE: Extract ONLY explicitly stated info. Never invent versions, paths, or dates.\n"
         "- PRESERVE LITERALS: Never translate or rephrase paths, commands, package names, versions, branch names.\n"
         "- BILINGUAL: Extract facts in the SAME language they were discussed. Do NOT translate.\n"
@@ -438,10 +449,38 @@ def compute_importance(session_id, messages, facts, model_importance):
 
 
 # ============================================================
+# P7: Language enforcement — reject facts in wrong language
+# ============================================================
+
+def validate_fact_language(fact_key, is_arabic_session):
+    """Reject facts that are in the wrong language for the session.
+    
+    If session is Arabic (>30% Arabic chars) and fact is pure ASCII → reject.
+    If session is English and fact is Arabic-heavy → reject.
+    Returns True if fact passes, False if it should be rejected.
+    """
+    if not fact_key:
+        return False
+    
+    fact_has_arabic = is_arabic_heavy(fact_key, 0.1)
+    
+    if is_arabic_session:
+        # Arabic session: accept Arabic facts, reject pure English
+        if not fact_has_arabic and fact_key.isascii():
+            return False  # English fact in Arabic session
+        return True
+    else:
+        # English session: reject Arabic-heavy facts (mixed is OK)
+        if fact_has_arabic and is_arabic_heavy(fact_key, 0.5):
+            return False  # Pure Arabic fact in English session
+        return True
+
+
+# ============================================================
 # Save results
 # ============================================================
 
-def save_summary(session_id, summary_data):
+def save_summary(session_id, summary_data, is_arabic_session=None):
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
     os.makedirs(FACTS_DIR, exist_ok=True)
 
@@ -458,6 +497,7 @@ def save_summary(session_id, summary_data):
     if not isinstance(facts, list):
         facts = []
     saved_count = 0
+    lang_rejected = 0
     for fact in facts:
         if not isinstance(fact, dict):
             continue
@@ -468,6 +508,11 @@ def save_summary(session_id, summary_data):
 
         # P0-1: Use unified quality gate (Arabic-aware + single skip phrases)
         if is_junk_fact(key):
+            continue
+
+        # P7: Language enforcement — reject wrong-language facts
+        if is_arabic_session is not None and not validate_fact_language(key, is_arabic_session):
+            lang_rejected += 1
             continue
 
         category = fact.get("category", "general")
@@ -498,6 +543,8 @@ def save_summary(session_id, summary_data):
         saved_count += 1
 
     print(f"  Facts saved: {saved_count}")
+    if lang_rejected:
+        print(f"  Facts rejected (wrong language): {lang_rejected}")
     return saved_count
 
 
@@ -631,6 +678,15 @@ def main():
             continue
 
         start = time.time()
+        # P7: Detect session language before generating summary
+        # Replicate the language detection from generate_summary()
+        conversation_text = " ".join(
+            (m.get("content") or "")[:200] for m in messages[:10]
+        )
+        arabic_chars = sum(1 for c in conversation_text if '\u0600' <= c <= '\u06FF')
+        total_chars = len(conversation_text.strip())
+        is_arabic_session = total_chars > 0 and (arabic_chars / total_chars) > 0.3
+        
         summary = generate_summary(sid, messages)
         elapsed = time.time() - start
         print(f"  LLM took: {elapsed:.1f}s")
@@ -647,19 +703,18 @@ def main():
             print("  Invalid summary format (no summary list), skipping")
             continue
 
-        n_facts = save_summary(sid, summary)
+        # P5: Compute importance BEFORE saving (corrected importance must persist to JSONL/DB)
+        model_importance = summary.get("importance", 3)
+        facts = summary.get("facts", [])
+        corrected_importance = compute_importance(sid, messages, facts, model_importance)
+        if corrected_importance != model_importance:
+            summary["importance"] = corrected_importance
+            summary["importance_source"] = "post_processing"
+            print(f"  Importance: {model_importance} → {corrected_importance} (post-processed)")
+
+        n_facts = save_summary(sid, summary, is_arabic_session)
         total_facts += n_facts
         summarized_count += 1
-
-        # P5: Override importance with content-based scoring
-        if summary and isinstance(summary, dict):
-            model_importance = summary.get("importance", 3)
-            facts = summary.get("facts", [])
-            corrected_importance = compute_importance(sid, messages, facts, model_importance)
-            if corrected_importance != model_importance:
-                summary["importance"] = corrected_importance
-                summary["importance_source"] = "post_processing"
-                print(f"  Importance: {model_importance} → {corrected_importance} (post-processed)")
 
         # Persist tracker immediately per-session — crash-safe, no re-summarize
         tracker = load_tracker()
